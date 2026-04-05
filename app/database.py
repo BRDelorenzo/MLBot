@@ -1,20 +1,15 @@
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-DATABASE_URL = "sqlite:///./oem_ml.db"
-# Em produção, depois trocamos para PostgreSQL:
-# DATABASE_URL = "postgresql+psycopg2://user:password@localhost:5432/oem_ml"
+from app.config import settings
 
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False}  # necessário para SQLite
-)
+connect_args = {}
+if settings.database_url.startswith("sqlite"):
+    connect_args["check_same_thread"] = False
 
-SessionLocal = sessionmaker(
-    autocommit=False,
-    autoflush=False,
-    bind=engine
-)
+engine = create_engine(settings.database_url, connect_args=connect_args)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
 

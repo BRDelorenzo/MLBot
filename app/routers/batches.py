@@ -40,8 +40,8 @@ async def import_oem_batch(
     content = await file.read()
     try:
         text = content.decode("utf-8")
-    except UnicodeDecodeError:
-        raise HTTPException(status_code=400, detail="Arquivo precisa estar em UTF-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Arquivo precisa estar em UTF-8") from exc
 
     oems = parse_txt_content(text)
     if not oems:

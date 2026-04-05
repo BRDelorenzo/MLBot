@@ -1,19 +1,25 @@
-from datetime import datetime
-from enum import Enum
+from datetime import UTC, datetime
+from enum import StrEnum
 
-from sqlalchemy import Column, DateTime, Enum as SAEnum, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import relationship
 
 from app.database import Base
 
 
-class UserRole(str, Enum):
+def _utcnow():
+    """UTC naive datetime — compatível com SQLite que não armazena timezone."""
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
+class UserRole(StrEnum):
     admin = "admin"
     operator = "operator"
     reviewer = "reviewer"
 
 
-class ItemStatus(str, Enum):
+class ItemStatus(StrEnum):
     imported = "imported"
     normalized = "normalized"
     enriching = "enriching"
@@ -31,12 +37,12 @@ class ItemStatus(str, Enum):
     publish_error = "publish_error"
 
 
-class ImageType(str, Enum):
+class ImageType(StrEnum):
     original = "original"
     processed = "processed"
 
 
-class ListingStatus(str, Enum):
+class ListingStatus(StrEnum):
     draft = "draft"
     validating = "validating"
     valid = "valid"
@@ -54,7 +60,7 @@ class User(Base):
     email = Column(String(255), unique=True, index=True, nullable=False)
     password_hash = Column(String(255), nullable=False)
     role = Column(SAEnum(UserRole), default=UserRole.operator, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
 
 
 class ImportBatch(Base):
@@ -65,7 +71,7 @@ class ImportBatch(Base):
     total_items = Column(Integer, default=0, nullable=False)
     total_valid = Column(Integer, default=0, nullable=False)
     total_invalid = Column(Integer, default=0, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
 
     items = relationship("ImportItem", back_populates="batch", cascade="all, delete-orphan")
 
@@ -79,7 +85,7 @@ class ImportItem(Base):
     oem_normalized = Column(String(120), index=True, nullable=False)
     status = Column(SAEnum(ItemStatus), default=ItemStatus.imported, nullable=False)
     error_message = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
 
     batch = relationship("ImportBatch", back_populates="items")
     product = relationship("Product", back_populates="import_item", uselist=False)
@@ -98,8 +104,8 @@ class Product(Base):
     confidence_level = Column(Integer, nullable=True)
     source_data = Column(String(120), nullable=True)
     last_confirmed_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
     import_item = relationship("ImportItem", back_populates="product")
     compatibilities = relationship("ProductCompatibility", back_populates="product", cascade="all, delete-orphan")
@@ -139,14 +145,14 @@ class ProductPricing(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     product_id = Column(Integer, ForeignKey("products.id"), unique=True, nullable=False)
-    cost = Column(Float, nullable=False)
-    estimated_shipping = Column(Float, default=0, nullable=False)
+    cost = Column(Numeric(10, 2), nullable=False)
+    estimated_shipping = Column(Numeric(10, 2), default=0, nullable=False)
     commission_percent = Column(Float, default=0.16, nullable=False)
-    fixed_fee = Column(Float, default=0, nullable=False)
+    fixed_fee = Column(Numeric(10, 2), default=0, nullable=False)
     margin_percent = Column(Float, default=0.20, nullable=False)
-    suggested_price = Column(Float, default=0, nullable=False)
-    final_price = Column(Float, nullable=True)
-    calculated_at = Column(DateTime, default=datetime.utcnow)
+    suggested_price = Column(Numeric(10, 2), default=0, nullable=False)
+    final_price = Column(Numeric(10, 2), nullable=True)
+    calculated_at = Column(DateTime, default=_utcnow)
 
     product = relationship("Product", back_populates="pricing")
 
@@ -159,10 +165,10 @@ class Image(Base):
     image_type = Column(SAEnum(ImageType), default=ImageType.original, nullable=False)
     sort_order = Column(Integer, default=1, nullable=False)
     filename = Column(String(255), nullable=False)
-    storage_path = Column(String(255), nullable=False)
+    storage_path = Column(String(500), nullable=False)
     mime_type = Column(String(80), nullable=True)
     status = Column(String(50), default="uploaded", nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
 
     product = relationship("Product", back_populates="images")
 
@@ -176,11 +182,27 @@ class Listing(Base):
     description = Column(Text, nullable=True)
     ml_category = Column(String(120), nullable=True)
     condition = Column(String(40), default="new", nullable=False)
-    price = Column(Float, nullable=True)
+    price = Column(Numeric(10, 2), nullable=True)
     quantity = Column(Integer, default=1, nullable=False)
     status = Column(SAEnum(ListingStatus), default=ListingStatus.draft, nullable=False)
     ml_item_id = Column(String(120), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
     product = relationship("Product", back_populates="listing")
+
+
+class MLCredential(Base):
+    __tablename__ = "ml_credentials"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, nullable=True)
+    ml_user_id = Column(String(80), nullable=True)
+    access_token_encrypted = Column(Text, nullable=False)
+    refresh_token_encrypted = Column(Text, nullable=False)
+    token_type = Column(String(40), default="Bearer", nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    scope = Column(String(255), nullable=True)
+    pkce_verifier = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)

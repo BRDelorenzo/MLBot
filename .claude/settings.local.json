@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sqlite3 /c/Users/giovanni/Documents/GitHub/Diretorios/MLBot/oem_ml.db .schema)",
+      "Bash(git rm:*)",
+      "Bash(pip install:*)",
+      "Bash(python -m pytest tests/ -v)",
+      "Bash(ruff check:*)",
+      "Bash(timeout 5 python -c \"from app.main import app; print\\(''App loaded successfully''\\); print\\(''Routes:'', [r.path for r in app.routes]\\)\")",
+      "Bash(python -m pytest tests/ -q)",
+      "Bash(python -c ':*)",
+      "Bash(python -c \"from cryptography.fernet import Fernet; print\\(Fernet.generate_key\\(\\).decode\\(\\)\\)\")",
+      "Bash(python -c \"from app.main import app; print\\('OK -', len\\(app.routes\\), 'routes'\\)\")",
+      "Bash(python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000)",
+      "Bash(curl -s http://127.0.0.1:8000/health)",
+      "Bash(taskkill //F //IM uvicorn.exe)",
+      "Bash(taskkill //F //FI \"WINDOWTITLE eq uvicorn*\")",
+      "Bash(pkill -f uvicorn)",
+      "Bash(curl -s http://127.0.0.1:8000/batches)",
+      "Bash(curl -s http://127.0.0.1:8000/auth/ml/status)",
+      "Bash(find \"c:/Users/giovanni/Documents/GitHub/Diretorios/MLBot/app\" -name \"__pycache__\" -type d -exec rm -rf {} +)",
+      "Bash(python -m uvicorn app.main:app --host 127.0.0.1 --port 8000)",
+      "Read(//tmp/**)",
+      "Bash(netstat -ano)",
+      "Bash(taskkill //F //IM python.exe)",
+      "Bash(find /c/Users/giovanni/Documents/GitHub/Diretorios/MLBot -name \"__pycache__\" -type d -exec rm -rf {} +)"
+    ]
+  }
+}

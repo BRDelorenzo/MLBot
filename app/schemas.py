@@ -1,5 +1,4 @@
 from datetime import datetime
-from typing import Optional, List
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -34,7 +33,7 @@ class ImportItemOut(BaseModel):
     oem_raw: str
     oem_normalized: str
     status: ItemStatus
-    error_message: Optional[str]
+    error_message: str | None
     created_at: datetime
 
 
@@ -45,7 +44,7 @@ class CompatibilityOut(BaseModel):
     motorcycle_model: str
     year_start: int
     year_end: int
-    notes: Optional[str] = None
+    notes: str | None = None
 
 
 class AttributeOut(BaseModel):
@@ -60,22 +59,22 @@ class ProductOut(BaseModel):
 
     id: int
     oem: str
-    part_name: Optional[str]
-    brand: Optional[str]
-    category: Optional[str]
-    technical_description: Optional[str]
-    confidence_level: Optional[int]
-    source_data: Optional[str]
-    compatibilities: List[CompatibilityOut] = []
-    attributes: List[AttributeOut] = []
+    part_name: str | None
+    brand: str | None
+    category: str | None
+    technical_description: str | None
+    confidence_level: int | None
+    source_data: str | None
+    compatibilities: list[CompatibilityOut] = []
+    attributes: list[AttributeOut] = []
 
 
 class ProductUpdateIn(BaseModel):
-    part_name: Optional[str] = Field(default=None, max_length=255)
-    brand: Optional[str] = Field(default=None, max_length=120)
-    category: Optional[str] = Field(default=None, max_length=120)
-    technical_description: Optional[str] = None
-    confidence_level: Optional[int] = Field(default=None, ge=0, le=100)
+    part_name: str | None = Field(default=None, max_length=255)
+    brand: str | None = Field(default=None, max_length=120)
+    category: str | None = Field(default=None, max_length=120)
+    technical_description: str | None = None
+    confidence_level: int | None = Field(default=None, ge=0, le=100)
 
 
 class PricingRequest(BaseModel):
@@ -95,23 +94,44 @@ class PricingOut(BaseModel):
     fixed_fee: float
     margin_percent: float
     suggested_price: float
-    final_price: Optional[float]
+    final_price: float | None
 
 
 class ListingOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
-    title: Optional[str]
-    description: Optional[str]
-    ml_category: Optional[str]
+    title: str | None
+    description: str | None
+    ml_category: str | None
     condition: str
-    price: Optional[float]
+    price: float | None
     quantity: int
     status: ListingStatus
-    ml_item_id: Optional[str]
+    ml_item_id: str | None
 
 
 class ValidationResponse(BaseModel):
     valid: bool
     errors: list[str]
+
+
+# --- Mercado Livre ---
+
+class MLAuthURL(BaseModel):
+    auth_url: str
+
+
+class MLTokenOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    ml_user_id: str | None
+    token_type: str
+    expires_at: datetime
+    scope: str | None
+
+
+class MLPublishResult(BaseModel):
+    ml_item_id: str
+    permalink: str | None = None
+    status: str

@@ -24,5 +24,17 @@ class Settings(BaseSettings):
     upload_dir: str = "uploads"
     max_image_size_mb: int = 10
 
+    # AI / Anthropic
+    anthropic_api_key: str = ""
+    anthropic_model: str = "claude-sonnet-4-20250514"
+
+    # JWT Auth
+    jwt_secret: str = ""
+    jwt_algorithm: str = "HS256"
+    jwt_expire_hours: int = 24
+
+    # Knowledge Base
+    kb_upload_dir: str = "uploads/kb"
+
 
 settings = Settings()

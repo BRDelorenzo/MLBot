@@ -19,9 +19,13 @@ def ml_login(db: Session = Depends(get_db)):
 
 
 @router.get("/callback", response_model=MLTokenOut)
-def ml_callback(code: str = Query(...), db: Session = Depends(get_db)):
+def ml_callback(
+    code: str = Query(...),
+    state: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
     try:
-        credential = exchange_code_for_token(code, db)
+        credential = exchange_code_for_token(code, db, state=state)
     except MLAPIError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 

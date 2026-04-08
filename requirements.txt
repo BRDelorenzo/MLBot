@@ -7,6 +7,20 @@ httpx>=0.28,<1
 python-multipart>=0.0.20
 cryptography>=44.0,<45
 
+# Auth
+PyJWT>=2.0,<3
+pydantic[email]
+
+# AI / Knowledge Base
+anthropic>=0.49,<1
+openai>=1.0,<2
+google-generativeai>=0.8,<1
+pymupdf>=1.25,<2
+
+# Image Processing
+rembg[cpu]>=2.0,<3
+pillow>=10.0,<11
+
 # Dev / Test
 pytest>=8.0,<9
 pytest-asyncio>=0.25,<1

@@ -2,7 +2,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.models import ItemStatus, ListingStatus, UserRole
+from app.models import ItemStatus, KBDocumentStatus, ListingStatus, UserRole
 
 
 class UserOut(BaseModel):
@@ -70,10 +70,10 @@ class ProductOut(BaseModel):
 
 
 class ProductUpdateIn(BaseModel):
-    part_name: str | None = Field(default=None, max_length=255)
-    brand: str | None = Field(default=None, max_length=120)
-    category: str | None = Field(default=None, max_length=120)
-    technical_description: str | None = None
+    part_name: str | None = Field(default=None, min_length=1, max_length=255)
+    brand: str | None = Field(default=None, min_length=1, max_length=120)
+    category: str | None = Field(default=None, min_length=1, max_length=120)
+    technical_description: str | None = Field(default=None, min_length=1)
     confidence_level: int | None = Field(default=None, ge=0, le=100)
 
 
@@ -135,3 +135,57 @@ class MLPublishResult(BaseModel):
     ml_item_id: str
     permalink: str | None = None
     status: str
+
+
+# --- Knowledge Base ---
+
+class KBCompatibilityOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    motorcycle_model: str
+    year_info: str | None
+
+
+class KBEntryOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    oem_code: str
+    oem_code_normalized: str
+    honda_part_name: str | None
+    honda_price: float | None = None
+    section_context: str | None = None
+    page_number: int | None = None
+    compatibilities: list[KBCompatibilityOut] = []
+
+
+class KBDocumentOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    filename: str
+    document_type: str
+    brand: str
+    page_count: int | None
+    status: KBDocumentStatus
+    error_message: str | None
+    created_at: datetime
+    entry_count: int = 0
+
+
+class KBSearchResult(BaseModel):
+    oem_code: str
+    entries: list[KBEntryOut]
+    found_in_kb: bool
+
+
+class EnrichmentResult(BaseModel):
+    product_id: int
+    common_name: str
+    confidence: int
+    source: str
+    provider: str = ""
+    model: str = ""
+    honda_price: float | None = None
+    compatibilities_count: int
+    attributes_count: int

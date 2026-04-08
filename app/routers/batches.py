@@ -4,8 +4,9 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import ImportBatch, ImportItem, ItemStatus, Product
+from app.models import ImportBatch, ImportItem, ItemStatus, Product, User
 from app.schemas import BatchOut, ImportItemOut
+from app.services.auth import get_optional_user
 
 router = APIRouter(prefix="/batches", tags=["batches"])
 
@@ -33,6 +34,7 @@ def parse_txt_content(raw_text: str) -> list[str]:
 async def import_oem_batch(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
+    user: User | None = Depends(get_optional_user),
 ):
     if not file.filename.endswith(".txt"):
         raise HTTPException(status_code=400, detail="Envie um arquivo .txt")
@@ -49,6 +51,7 @@ async def import_oem_batch(
 
     batch = ImportBatch(
         filename=file.filename,
+        user_id=user.id if user else None,
         total_items=len(oems),
         total_valid=len(oems),
         total_invalid=0,
@@ -66,13 +69,18 @@ async def import_oem_batch(
         db.add(item)
         db.flush()
 
-        existing_product = db.query(Product).filter(Product.oem == oem).first()
+        # Verifica duplicatas apenas do mesmo usuário
+        q = db.query(Product).filter(Product.oem == oem)
+        if user:
+            q = q.filter(Product.user_id == user.id)
+        existing_product = q.first()
         if existing_product:
             item.status = ItemStatus.awaiting_review
             continue
 
         product = Product(
             import_item_id=item.id,
+            user_id=user.id if user else None,
             oem=oem,
             source_data="internal_seed",
             confidence_level=0,
@@ -86,8 +94,14 @@ async def import_oem_batch(
 
 
 @router.get("", response_model=list[BatchOut])
-def list_batches(db: Session = Depends(get_db)):
-    return db.query(ImportBatch).order_by(ImportBatch.id.desc()).all()
+def list_batches(
+    db: Session = Depends(get_db),
+    user: User | None = Depends(get_optional_user),
+):
+    q = db.query(ImportBatch)
+    if user:
+        q = q.filter(ImportBatch.user_id == user.id)
+    return q.order_by(ImportBatch.id.desc()).all()
 
 
 @router.get("/{batch_id}/items", response_model=list[ImportItemOut])

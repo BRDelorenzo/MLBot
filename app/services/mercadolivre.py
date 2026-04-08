@@ -38,8 +38,9 @@ def _generate_pkce() -> tuple[str, str]:
 
 def get_auth_url(db: Session) -> str:
     code_verifier, code_challenge = _generate_pkce()
+    oauth_state = secrets.token_urlsafe(32)
 
-    # Persiste o verifier no banco para sobreviver a restarts e múltiplos workers
+    # Persiste o verifier e state no banco para sobreviver a restarts e múltiplos workers
     credential = db.query(MLCredential).first()
     if not credential:
         credential = MLCredential(
@@ -48,7 +49,8 @@ def get_auth_url(db: Session) -> str:
             expires_at=_utcnow(),
         )
         db.add(credential)
-    credential.pkce_verifier = code_verifier
+    credential.pkce_verifier = encrypt(code_verifier)
+    credential.oauth_state = oauth_state
     db.commit()
 
     params = {
@@ -57,16 +59,22 @@ def get_auth_url(db: Session) -> str:
         "redirect_uri": settings.ml_redirect_uri,
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
+        "state": oauth_state,
     }
     return f"{settings.ml_auth_url}?{urlencode(params)}"
 
 
-def exchange_code_for_token(code: str, db: Session) -> MLCredential:
+def exchange_code_for_token(code: str, db: Session, state: str | None = None) -> MLCredential:
     credential = db.query(MLCredential).first()
-    code_verifier = credential.pkce_verifier if credential else None
 
-    if not code_verifier:
+    if not credential or not credential.pkce_verifier:
         raise MLAPIError(400, "Nenhum code_verifier encontrado. Acesse /auth/ml/login primeiro para iniciar o fluxo.")
+
+    # Valida state para prevenir CSRF
+    if credential.oauth_state and state != credential.oauth_state:
+        raise MLAPIError(400, "State inválido. Possível ataque CSRF. Reinicie o fluxo de login.")
+
+    code_verifier = decrypt(credential.pkce_verifier)
 
     payload = {
         "grant_type": "authorization_code",
@@ -93,6 +101,7 @@ def exchange_code_for_token(code: str, db: Session) -> MLCredential:
     credential.scope = data.get("scope", "")
     credential.ml_user_id = str(data.get("user_id", ""))
     credential.pkce_verifier = None  # Limpa após uso
+    credential.oauth_state = None
 
     db.commit()
     db.refresh(credential)

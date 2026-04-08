@@ -8,15 +8,29 @@ const API = '';
 let currentView = 'dashboard';
 let products = [];
 let batches = [];
+let currentUser = null;
+
+// --- Auth ---
+function getToken() { return localStorage.getItem('mlbot_token'); }
+function setToken(token) { localStorage.setItem('mlbot_token', token); }
+function clearToken() { localStorage.removeItem('mlbot_token'); currentUser = null; }
+
+function authHeaders() {
+  const token = getToken();
+  return token ? { 'Authorization': `Bearer ${token}` } : {};
+}
 
 // --- API helpers ---
 async function api(path, opts = {}) {
-  const res = await fetch(`${API}${path}`, {
-    headers: { 'Accept': 'application/json', ...(opts.headers || {}) },
-    ...opts,
-  });
+  const headers = { 'Accept': 'application/json', ...authHeaders(), ...(opts.headers || {}) };
+  const res = await fetch(`${API}${path}`, { ...opts, headers });
   const data = res.headers.get('content-type')?.includes('json') ? await res.json() : null;
   if (!res.ok) {
+    if (res.status === 401 && !path.startsWith('/auth/')) {
+      clearToken();
+      renderAuth();
+      throw new Error('Sessão expirada');
+    }
     const msg = data?.detail || `Erro ${res.status}`;
     throw new Error(msg);
   }
@@ -91,6 +105,7 @@ function renderView(view, data) {
     case 'import': renderImport(main); break;
     case 'products': renderProducts(main); break;
     case 'product-detail': renderProductDetail(main, data); break;
+    case 'kb': renderKnowledgeBase(main); break;
     case 'auth': renderAuth(main); break;
     default: main.innerHTML = '<div class="empty-state"><h3>Página não encontrada</h3></div>';
   }
@@ -101,17 +116,18 @@ async function renderDashboard(el) {
   el.innerHTML = '<div class="view"><div class="spinner"></div></div>';
 
   try {
-    const [prods, batchList, authStatus] = await Promise.all([
+    const [prods, batchList, authStatus, kbStats] = await Promise.all([
       api('/products'),
       api('/batches'),
       api('/auth/ml/status'),
+      api('/kb/stats'),
     ]);
     products = prods;
     batches = batchList;
 
     const total = products.length;
-    const published = products.filter(p => p.source_data === 'mock_provider').length; // approximate
-    const pending = total - published;
+    const enriched = products.filter(p => p.part_name && p.brand && p.category).length;
+    const pending = total - enriched;
 
     el.innerHTML = `
       <div class="view">
@@ -136,8 +152,16 @@ async function renderDashboard(el) {
             <div class="stat-label">Lotes Importados</div>
           </div>
           <div class="stat-card">
+            <div class="stat-value">${enriched}</div>
+            <div class="stat-label">Enriquecidos</div>
+          </div>
+          <div class="stat-card">
             <div class="stat-value">${pending}</div>
-            <div class="stat-label">Em Processamento</div>
+            <div class="stat-label">Pendentes</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value">${kbStats.total_entries}</div>
+            <div class="stat-label">OEMs na KB (${kbStats.coverage_pct}% cobertura)</div>
           </div>
           <div class="stat-card">
             <div class="stat-value">
@@ -321,10 +345,11 @@ async function renderProductDetail(el, productId) {
         <!-- Actions -->
         <div class="section">
           <h2 class="section-header">Ações Rápidas</h2>
-          <div class="flex gap-3" style="flex-wrap:wrap">
-            <button class="btn btn-secondary" onclick="actionEnrich(${productId})">Enriquecer (Mock)</button>
+          <div class="action-bar">
+            <button class="btn btn-primary" onclick="actionAIEnrich(${productId})" id="btn-ai-enrich">Enriquecer com IA</button>
             <button class="btn btn-secondary" onclick="showPricingForm(${productId})">Calcular Preço</button>
             <button class="btn btn-secondary" onclick="showImageUpload(${productId})">Upload Imagens</button>
+            <button class="btn btn-secondary" onclick="processBackground(${productId})" id="btn-process-bg">Tratar Fundo</button>
             <button class="btn btn-secondary" onclick="actionGenerate(${productId})">Gerar Anúncio</button>
             <button class="btn btn-secondary" onclick="actionValidate(${productId})">Validar</button>
             <button class="btn btn-primary" onclick="actionPublish(${productId})">Publicar no ML</button>
@@ -351,6 +376,10 @@ async function renderProductDetail(el, productId) {
               <div class="detail-field">
                 <span class="detail-label">Confiança</span>
                 <span class="detail-value">${product.confidence_level != null ? product.confidence_level + '%' : '—'}</span>
+              </div>
+              <div class="detail-field">
+                <span class="detail-label">Fonte</span>
+                <span class="detail-value">${product.source_data === 'kb+ai' ? '<span class="badge badge-success">KB + IA</span>' : product.source_data === 'ai_only' ? '<span class="badge badge-info">IA</span>' : product.source_data === 'mock_provider' ? '<span class="badge badge-neutral">Mock</span>' : '—'}</span>
               </div>
               <div class="detail-field" style="grid-column:1/-1">
                 <span class="detail-label">Descrição Técnica</span>
@@ -409,6 +438,20 @@ async function renderProductDetail(el, productId) {
 }
 
 // --- Product Actions ---
+async function actionAIEnrich(id) {
+  const btn = document.getElementById('btn-ai-enrich');
+  if (btn) { btn.disabled = true; btn.textContent = 'Enriquecendo...'; }
+
+  try {
+    const result = await api(`/products/${id}/ai-enrich`, { method: 'POST' });
+    toast(`${result.provider} [${result.model}]: ${result.common_name} (${result.confidence}% confiança)`, 'success');
+    navigate('product-detail', id);
+  } catch (err) {
+    toast(err.message, 'error');
+    if (btn) { btn.disabled = false; btn.textContent = 'Enriquecer com IA'; }
+  }
+}
+
 async function actionEnrich(id) {
   try {
     await api(`/products/${id}/mock-enrich`, { method: 'POST' });
@@ -453,31 +496,54 @@ async function actionPublish(id) {
   } catch (err) { toast(err.message, 'error'); }
 }
 
-function showPricingForm(id) {
+async function showPricingForm(id) {
   const area = document.getElementById('action-area');
+  area.innerHTML = `<div class="card section"><p>Carregando dados de preço...</p></div>`;
+
+  let info = { cost: 0, estimated_shipping: 0, commission_percent: 0.16, fixed_fee: 0, margin_percent: 0.20, honda_price: null };
+  try {
+    info = await api(`/products/${id}/pricing/info`);
+  } catch (e) { /* usa defaults */ }
+
+  const costValue = info.honda_price || info.cost || 0;
+  const hondaBadge = info.honda_price
+    ? `<div style="background:var(--info-subtle);padding:var(--space-3);border-radius:var(--radius-md);margin-bottom:var(--space-4)">
+        <strong>Preço Honda (catálogo):</strong> R$ ${parseFloat(info.honda_price).toFixed(2)}
+        <span style="color:var(--text-tertiary);margin-left:8px">— preenchido automaticamente no custo</span>
+      </div>`
+    : '';
+
+  const existingPrice = info.suggested_price
+    ? `<div style="background:var(--success-subtle);padding:var(--space-3);border-radius:var(--radius-md);margin-bottom:var(--space-4)">
+        <strong>Preço atual:</strong> R$ ${parseFloat(info.suggested_price).toFixed(2)}
+        ${info.final_price ? ` | <strong>Final:</strong> R$ ${parseFloat(info.final_price).toFixed(2)}` : ''}
+      </div>`
+    : '';
+
   area.innerHTML = `
     <div class="card section">
       <h2 class="section-header">Calcular Preço</h2>
+      ${hondaBadge}${existingPrice}
       <div class="detail-grid">
         <div class="form-group">
           <label class="form-label">Custo (R$)</label>
-          <input type="number" step="0.01" id="price-cost" class="form-input" placeholder="0.00" value="50">
+          <input type="number" step="0.01" id="price-cost" class="form-input" placeholder="0.00" value="${costValue}">
         </div>
         <div class="form-group">
           <label class="form-label">Frete Estimado (R$)</label>
-          <input type="number" step="0.01" id="price-shipping" class="form-input" placeholder="0.00" value="15">
+          <input type="number" step="0.01" id="price-shipping" class="form-input" placeholder="0.00" value="${info.estimated_shipping}">
         </div>
         <div class="form-group">
           <label class="form-label">Comissão ML (%)</label>
-          <input type="number" step="0.01" id="price-commission" class="form-input" placeholder="0.16" value="0.16">
+          <input type="number" step="0.01" id="price-commission" class="form-input" placeholder="0.16" value="${info.commission_percent}">
         </div>
         <div class="form-group">
           <label class="form-label">Taxa Fixa (R$)</label>
-          <input type="number" step="0.01" id="price-fee" class="form-input" placeholder="0.00" value="6">
+          <input type="number" step="0.01" id="price-fee" class="form-input" placeholder="0.00" value="${info.fixed_fee}">
         </div>
         <div class="form-group">
           <label class="form-label">Margem (%)</label>
-          <input type="number" step="0.01" id="price-margin" class="form-input" placeholder="0.20" value="0.20">
+          <input type="number" step="0.01" id="price-margin" class="form-input" placeholder="0.20" value="${info.margin_percent}">
         </div>
       </div>
       <div class="mt-4">
@@ -591,6 +657,328 @@ async function submitImages(id) {
     document.getElementById('img-result').innerHTML = `<div style="color:var(--error)">${err.message}</div>`;
     toast(err.message, 'error');
   }
+}
+
+async function processBackground(id) {
+  const btn = document.getElementById('btn-process-bg');
+  const oldText = btn.textContent;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner" style="width:14px;height:14px"></span> Processando...';
+
+  const area = document.getElementById('action-area');
+  area.innerHTML = `
+    <div class="card section">
+      <h2 class="section-header">Tratamento de Fundo</h2>
+      <div class="flex items-center gap-2">
+        <div class="spinner"></div>
+        <span>Removendo fundo e aplicando fundo branco nas imagens... Isso pode levar alguns segundos.</span>
+      </div>
+    </div>
+  `;
+
+  try {
+    const result = await api(`/products/${id}/images/process-background`, { method: 'POST' });
+    area.innerHTML = `
+      <div class="card section">
+        <h2 class="section-header">Tratamento de Fundo</h2>
+        <div style="background:var(--success-subtle);padding:var(--space-4);border-radius:var(--radius-md)">
+          <strong>${result.message}</strong>
+          ${result.errors.length ? `<div style="color:var(--error);margin-top:8px">Erros: ${result.errors.map(e => e.file).join(', ')}</div>` : ''}
+        </div>
+        <div style="margin-top:var(--space-4);font-size:13px;color:var(--text-secondary)">
+          As imagens processadas serao usadas automaticamente na publicacao do anuncio.
+        </div>
+      </div>
+    `;
+    toast(result.message, 'success');
+  } catch (err) {
+    area.innerHTML = `
+      <div class="card section">
+        <h2 class="section-header">Tratamento de Fundo</h2>
+        <div style="color:var(--error)">${err.message}</div>
+      </div>
+    `;
+    toast(err.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = oldText;
+  }
+}
+
+// --- Knowledge Base ---
+async function renderKnowledgeBase(el) {
+  el.innerHTML = '<div class="view"><div class="spinner"></div></div>';
+
+  try {
+    const [docs, stats, providers] = await Promise.all([
+      api('/kb/documents'),
+      api('/kb/stats'),
+      api('/kb/ai-providers'),
+    ]);
+
+    const anyConfigured = providers.some(p => p.configured);
+
+    el.innerHTML = `
+      <div class="view">
+        <div class="page-header">
+          <div>
+            <h1>Base de Conhecimento</h1>
+            <p>Catálogos Honda para enriquecimento inteligente</p>
+          </div>
+        </div>
+
+        <!-- AI Providers -->
+        <div class="section">
+          <h2 class="section-header">Provedores de IA</h2>
+          <p style="color:var(--text-tertiary);font-size:12px;margin-bottom:var(--space-4)">
+            Configure pelo menos um provedor. O primeiro configurado será usado por padrão.
+          </p>
+          <div class="provider-grid">
+            ${providers.map(p => `
+              <div class="card provider-card" id="provider-card-${p.id}">
+                <div class="flex items-center gap-3" style="margin-bottom:var(--space-4)">
+                  <span class="status-dot ${p.configured ? 'connected' : 'disconnected'}"></span>
+                  <span style="font-weight:600;font-size:14px">${p.name}</span>
+                </div>
+                ${p.configured ? `
+                  <div style="margin-bottom:var(--space-3)">
+                    <span class="badge badge-success">Ativa</span>
+                    <span class="mono" style="color:var(--text-tertiary);font-size:11px;margin-left:var(--space-2)">${p.masked_key}</span>
+                  </div>
+                  <div style="margin-bottom:var(--space-3)">
+                    <span class="detail-label">Modelo</span>
+                    <span class="mono" style="font-size:12px">${p.selected_model}</span>
+                  </div>
+                  <div class="flex gap-2">
+                    <button class="btn btn-ghost btn-sm" onclick="toggleProviderForm('${p.id}')">Alterar</button>
+                    <button class="btn btn-danger btn-sm" onclick="removeProvider('${p.id}')">Remover</button>
+                  </div>
+                ` : `
+                  <p style="color:var(--text-tertiary);font-size:12px;margin-bottom:var(--space-3)">Nenhuma chave configurada</p>
+                `}
+                <div id="provider-form-${p.id}" style="${p.configured ? 'display:none;' : ''}margin-top:var(--space-3)">
+                  <div class="form-group" style="margin-bottom:var(--space-3)">
+                    <label class="form-label">API Key</label>
+                    <input type="password" id="key-${p.id}" class="form-input" placeholder="${p.id === 'anthropic' ? 'sk-ant-api03-...' : p.id === 'openai' ? 'sk-...' : 'AI...'}">
+                  </div>
+                  <div class="form-group" style="margin-bottom:var(--space-3)">
+                    <label class="form-label">Modelo</label>
+                    <select id="model-${p.id}" class="form-select">
+                      ${p.models.map(m => `<option value="${m}" ${m === p.selected_model ? 'selected' : ''}>${m}</option>`).join('')}
+                    </select>
+                  </div>
+                  <button class="btn btn-primary btn-sm" onclick="saveProvider('${p.id}')">Salvar</button>
+                  <div id="provider-result-${p.id}" class="mt-4"></div>
+                </div>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+
+        <div class="stats-grid section">
+          <div class="stat-card">
+            <div class="stat-value">${stats.total_documents}</div>
+            <div class="stat-label">Documentos</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value">${stats.total_entries}</div>
+            <div class="stat-label">OEMs Extraídos</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value">${stats.unique_oems}</div>
+            <div class="stat-label">OEMs Únicos</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value">${stats.coverage_pct}%</div>
+            <div class="stat-label">Cobertura (${stats.products_matched}/${stats.products_total})</div>
+          </div>
+        </div>
+
+        <!-- Upload -->
+        <div class="section">
+          <h2 class="section-header">Upload de Catálogo</h2>
+          <div class="card" style="max-width:560px">
+            <div class="upload-zone" id="kb-upload-zone" onclick="document.getElementById('kb-file-input').click()">
+              <div class="upload-icon">&#128214;</div>
+              <p><strong>Clique para selecionar</strong> ou arraste o catálogo PDF</p>
+              <p style="font-size:11px;margin-top:4px">Formato: .pdf — Catálogo de peças Honda</p>
+            </div>
+            <input type="file" id="kb-file-input" accept=".pdf" style="display:none" onchange="handleKBUpload(this)">
+            <div id="kb-upload-result" class="mt-4"></div>
+          </div>
+        </div>
+
+        <!-- Search -->
+        <div class="section">
+          <h2 class="section-header">Buscar OEM na Base</h2>
+          <div class="flex gap-3" style="max-width:560px">
+            <input type="text" id="kb-search-input" class="form-input" style="flex:1" placeholder="Ex: 53170-MEL-006">
+            <button class="btn btn-primary" onclick="searchKB()">Buscar</button>
+          </div>
+          <div id="kb-search-result" class="mt-4"></div>
+        </div>
+
+        <!-- Documents -->
+        ${docs.length > 0 ? `
+        <div class="section">
+          <h2 class="section-header">Documentos</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr>
+                <th>ID</th><th>Arquivo</th><th>Marca</th><th>Páginas</th><th>OEMs</th><th>Status</th><th>Ações</th>
+              </tr></thead>
+              <tbody>
+                ${docs.map(d => `
+                  <tr style="cursor:default">
+                    <td class="mono">#${d.id}</td>
+                    <td>${d.filename}</td>
+                    <td>${d.brand}</td>
+                    <td>${d.page_count || '—'}</td>
+                    <td>${d.entry_count}</td>
+                    <td>${kbStatusBadge(d.status)}</td>
+                    <td><button class="btn btn-danger btn-sm" onclick="event.stopPropagation();deleteKBDoc(${d.id})">Remover</button></td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>` : ''}
+      </div>
+    `;
+
+    // Drag & drop
+    const zone = document.getElementById('kb-upload-zone');
+    zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('dragover'); });
+    zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
+    zone.addEventListener('drop', e => {
+      e.preventDefault();
+      zone.classList.remove('dragover');
+      if (e.dataTransfer.files[0]) {
+        document.getElementById('kb-file-input').files = e.dataTransfer.files;
+        handleKBUpload(document.getElementById('kb-file-input'));
+      }
+    });
+
+    // Enter to search
+    const searchInput = document.getElementById('kb-search-input');
+    searchInput.addEventListener('keydown', e => { if (e.key === 'Enter') searchKB(); });
+
+  } catch (err) {
+    el.innerHTML = `<div class="empty-state"><h3>Erro</h3><p>${err.message}</p></div>`;
+  }
+}
+
+function kbStatusBadge(status) {
+  const map = {
+    pending: ['Pendente', 'neutral'],
+    processing: ['Processando', 'info'],
+    processed: ['Processado', 'success'],
+    error: ['Erro', 'error'],
+  };
+  const [label, variant] = map[status] || [status, 'neutral'];
+  return `<span class="badge badge-${variant}">${label}</span>`;
+}
+
+async function handleKBUpload(input) {
+  const file = input.files[0];
+  if (!file) return;
+
+  const result = document.getElementById('kb-upload-result');
+  result.innerHTML = '<div class="flex items-center gap-2"><div class="spinner"></div> Enviando e processando PDF...</div>';
+
+  try {
+    const form = new FormData();
+    form.append('file', file);
+    const data = await api('/kb/upload', { method: 'POST', body: form, headers: {} });
+    result.innerHTML = `
+      <div class="card" style="background:var(--success-subtle);border-color:var(--success)">
+        <strong>${data.filename}</strong> enviado com sucesso<br>
+        <span style="color:var(--text-secondary)">Status: ${data.status} — O processamento está sendo feito em background.</span>
+        <div class="mt-4">
+          <button class="btn btn-secondary btn-sm" onclick="navigate('kb')">Atualizar</button>
+        </div>
+      </div>
+    `;
+    toast('Catálogo enviado! Processamento em background.', 'success');
+  } catch (err) {
+    result.innerHTML = `<div class="card" style="border-color:var(--error);color:var(--error)">${err.message}</div>`;
+    toast(err.message, 'error');
+  }
+}
+
+async function searchKB() {
+  const input = document.getElementById('kb-search-input');
+  const oem = input.value.trim();
+  if (!oem) { toast('Digite um código OEM', 'error'); return; }
+
+  const resultEl = document.getElementById('kb-search-result');
+  resultEl.innerHTML = '<div class="flex items-center gap-2"><div class="spinner"></div> Buscando...</div>';
+
+  try {
+    const result = await api(`/kb/search?oem=${encodeURIComponent(oem)}`);
+    if (!result.found_in_kb) {
+      resultEl.innerHTML = `
+        <div class="card" style="border-color:var(--warning)">
+          <strong>OEM ${result.oem_code}</strong> não encontrado na base de conhecimento.
+          <p style="color:var(--text-tertiary);font-size:12px;margin-top:var(--space-2)">A IA ainda pode enriquecer este produto usando conhecimento geral.</p>
+        </div>
+      `;
+    } else {
+      resultEl.innerHTML = `
+        <div class="card" style="border-color:var(--success)">
+          <strong>${result.entries.length} entrada(s)</strong> encontrada(s) para <span class="mono">${result.oem_code}</span>
+          ${result.entries.map(e => `
+            <div style="margin-top:var(--space-3);padding:var(--space-3);background:var(--bg-elevated);border-radius:var(--radius-sm)">
+              <div><strong>Descrição Honda:</strong> ${e.honda_part_name || '—'}</div>
+              <div><strong>Preço Honda:</strong> ${e.honda_price ? 'R$ ' + parseFloat(e.honda_price).toFixed(2) : '—'}</div>
+              <div><strong>Página:</strong> ${e.page_number || '—'}</div>
+            </div>
+          `).join('')}
+        </div>
+      `;
+    }
+  } catch (err) {
+    resultEl.innerHTML = `<div style="color:var(--error)">${err.message}</div>`;
+  }
+}
+
+function toggleProviderForm(id) {
+  const form = document.getElementById(`provider-form-${id}`);
+  form.style.display = form.style.display === 'none' ? 'block' : 'none';
+}
+
+async function saveProvider(id) {
+  const key = document.getElementById(`key-${id}`).value.trim();
+  const model = document.getElementById(`model-${id}`).value;
+  if (!key) { toast('Cole a API Key', 'error'); return; }
+
+  const resultEl = document.getElementById(`provider-result-${id}`);
+  resultEl.innerHTML = '<div class="flex items-center gap-2"><div class="spinner"></div> Salvando...</div>';
+
+  try {
+    await apiPost(`/kb/ai-providers/${id}`, { api_key: key, model });
+    toast(`${id} configurado com sucesso`, 'success');
+    navigate('kb');
+  } catch (err) {
+    resultEl.innerHTML = `<div style="color:var(--error)">${err.message}</div>`;
+    toast(err.message, 'error');
+  }
+}
+
+async function removeProvider(id) {
+  try {
+    await api(`/kb/ai-providers/${id}`, { method: 'DELETE' });
+    toast(`${id} removido`, 'success');
+    navigate('kb');
+  } catch (err) { toast(err.message, 'error'); }
+}
+
+async function deleteKBDoc(id) {
+  try {
+    await api(`/kb/documents/${id}`, { method: 'DELETE' });
+    toast('Documento removido', 'success');
+    navigate('kb');
+  } catch (err) { toast(err.message, 'error'); }
 }
 
 // --- Auth ---
@@ -716,12 +1104,168 @@ async function updateAuthStatus() {
   } catch { /* silent */ }
 }
 
-// --- Init ---
-document.addEventListener('DOMContentLoaded', () => {
+// --- Auth UI ---
+function renderAuthScreen() {
+  const appEl = document.querySelector('.app');
+  const sidebar = document.querySelector('.sidebar');
+  const main = document.getElementById('main-content');
+
+  // Esconde sidebar e faz o main ocupar tudo
+  sidebar.style.display = 'none';
+  appEl.style.gridTemplateColumns = '1fr';
+
+  main.style.display = 'flex';
+  main.style.alignItems = 'center';
+  main.style.justifyContent = 'center';
+  main.style.maxHeight = '100vh';
+  main.style.padding = '0';
+
+  main.innerHTML = `
+    <div class="view" style="width:100%;max-width:400px;padding:var(--space-6)">
+      <div style="text-align:center;margin-bottom:var(--space-10)">
+        <div style="display:inline-flex;align-items:center;gap:var(--space-3);margin-bottom:var(--space-4)">
+          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
+          </svg>
+          <span style="font-size:32px;font-weight:800;letter-spacing:-0.04em"><span style="color:var(--accent)">ML</span>Bot</span>
+        </div>
+        <p style="color:var(--text-tertiary);font-size:14px">Automatize seus anuncios no Mercado Livre</p>
+      </div>
+
+      <div class="card" style="padding:var(--space-8)">
+        <div id="auth-tabs" style="display:flex;gap:0;margin-bottom:var(--space-8);border-radius:var(--radius-sm);overflow:hidden;border:1px solid var(--border-default)">
+          <button id="tab-login" style="flex:1;padding:10px;border:none;cursor:pointer;font-weight:600;font-size:13px;font-family:var(--font-sans);background:var(--accent);color:white;transition:all 150ms" onclick="showLoginForm()">Entrar</button>
+          <button id="tab-register" style="flex:1;padding:10px;border:none;cursor:pointer;font-weight:600;font-size:13px;font-family:var(--font-sans);background:var(--bg-elevated);color:var(--text-secondary);transition:all 150ms" onclick="showRegisterForm()">Criar Conta</button>
+        </div>
+        <div id="auth-form"></div>
+      </div>
+    </div>
+  `;
+  showLoginForm();
+}
+
+function _setActiveTab(tab) {
+  const login = document.getElementById('tab-login');
+  const register = document.getElementById('tab-register');
+  if (!login || !register) return;
+  if (tab === 'login') {
+    login.style.background = 'var(--accent)'; login.style.color = 'white';
+    register.style.background = 'var(--bg-elevated)'; register.style.color = 'var(--text-secondary)';
+  } else {
+    register.style.background = 'var(--accent)'; register.style.color = 'white';
+    login.style.background = 'var(--bg-elevated)'; login.style.color = 'var(--text-secondary)';
+  }
+}
+
+function showLoginForm() {
+  _setActiveTab('login');
+  document.getElementById('auth-form').innerHTML = `
+    <div class="form-group" style="margin-bottom:var(--space-5)">
+      <label class="form-label">Email</label>
+      <input type="email" id="auth-email" class="form-input" placeholder="seu@email.com" onkeydown="if(event.key==='Enter')doLogin()">
+    </div>
+    <div class="form-group" style="margin-bottom:var(--space-8)">
+      <label class="form-label">Senha</label>
+      <input type="password" id="auth-password" class="form-input" placeholder="••••••" onkeydown="if(event.key==='Enter')doLogin()">
+    </div>
+    <button class="btn btn-primary w-full" style="padding:12px;font-size:14px" onclick="doLogin()">Entrar</button>
+    <div id="auth-error" class="mt-4"></div>
+  `;
+  const emailInput = document.getElementById('auth-email');
+  if (emailInput) emailInput.focus();
+}
+
+function showRegisterForm() {
+  _setActiveTab('register');
+  document.getElementById('auth-form').innerHTML = `
+    <div class="form-group" style="margin-bottom:var(--space-5)">
+      <label class="form-label">Nome</label>
+      <input type="text" id="auth-name" class="form-input" placeholder="Seu nome" onkeydown="if(event.key==='Enter')document.getElementById('auth-email').focus()">
+    </div>
+    <div class="form-group" style="margin-bottom:var(--space-5)">
+      <label class="form-label">Email</label>
+      <input type="email" id="auth-email" class="form-input" placeholder="seu@email.com" onkeydown="if(event.key==='Enter')document.getElementById('auth-password').focus()">
+    </div>
+    <div class="form-group" style="margin-bottom:var(--space-8)">
+      <label class="form-label">Senha</label>
+      <input type="password" id="auth-password" class="form-input" placeholder="Min. 6 caracteres" onkeydown="if(event.key==='Enter')doRegister()">
+    </div>
+    <button class="btn btn-primary w-full" style="padding:12px;font-size:14px" onclick="doRegister()">Criar Conta</button>
+    <div id="auth-error" class="mt-4"></div>
+  `;
+  const nameInput = document.getElementById('auth-name');
+  if (nameInput) nameInput.focus();
+}
+
+async function doLogin() {
+  const email = document.getElementById('auth-email').value.trim();
+  const password = document.getElementById('auth-password').value;
+  if (!email || !password) { toast('Preencha email e senha', 'error'); return; }
+  try {
+    const result = await apiPost('/auth/login', { email, password });
+    setToken(result.token);
+    currentUser = result.user;
+    initApp();
+  } catch (err) {
+    document.getElementById('auth-error').innerHTML = `<div style="color:var(--error)">${err.message}</div>`;
+  }
+}
+
+async function doRegister() {
+  const name = document.getElementById('auth-name').value.trim();
+  const email = document.getElementById('auth-email').value.trim();
+  const password = document.getElementById('auth-password').value;
+  if (!name || !email || !password) { toast('Preencha todos os campos', 'error'); return; }
+  try {
+    const result = await apiPost('/auth/register', { name, email, password });
+    setToken(result.token);
+    currentUser = result.user;
+    initApp();
+  } catch (err) {
+    document.getElementById('auth-error').innerHTML = `<div style="color:var(--error)">${err.message}</div>`;
+  }
+}
+
+function doLogout() {
+  clearToken();
+  renderAuthScreen();
+}
+
+function initApp() {
+  const appEl = document.querySelector('.app');
+  const sidebar = document.querySelector('.sidebar');
+  const main = document.getElementById('main-content');
+
+  // Restaura layout do app após login
+  sidebar.style.display = '';
+  appEl.style.gridTemplateColumns = '';
+  main.style.display = '';
+  main.style.alignItems = '';
+  main.style.justifyContent = '';
+  main.style.maxHeight = '';
+  main.style.padding = '';
+
   document.querySelectorAll('.nav-item').forEach(btn => {
     btn.addEventListener('click', () => navigate(btn.dataset.view));
   });
   navigate('dashboard');
   updateAuthStatus();
+}
+
+// --- Init ---
+document.addEventListener('DOMContentLoaded', async () => {
+  const token = getToken();
+  if (token) {
+    try {
+      const user = await api('/auth/me');
+      currentUser = user;
+      initApp();
+    } catch {
+      clearToken();
+      renderAuthScreen();
+    }
+  } else {
+    renderAuthScreen();
+  }
   setInterval(updateAuthStatus, 30000);
 });

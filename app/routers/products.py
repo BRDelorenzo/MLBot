@@ -1,4 +1,5 @@
 import os
+import secrets
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
@@ -15,9 +16,13 @@ from app.models import (
     ProductAttribute,
     ProductCompatibility,
     ProductPricing,
+    User,
 )
 from app.models import _utcnow as utcnow
-from app.schemas import PricingOut, PricingRequest, ProductOut, ProductUpdateIn
+from app.schemas import EnrichmentResult, PricingOut, PricingRequest, ProductOut, ProductUpdateIn
+from app.services.ai_enrichment import enrich_product as ai_enrich, lookup_kb, _get_honda_price
+from app.services.auth import get_optional_user
+from app.services.image_processing import remove_background
 
 router = APIRouter(prefix="/products", tags=["products"])
 
@@ -48,12 +53,15 @@ def calculate_suggested_price(
 def list_products(
     status: ItemStatus | None = Query(default=None),
     db: Session = Depends(get_db),
+    user: User | None = Depends(get_optional_user),
 ):
     query = (
         db.query(Product)
         .options(joinedload(Product.compatibilities), joinedload(Product.attributes))
         .join(ImportItem, Product.import_item_id == ImportItem.id)
     )
+    if user:
+        query = query.filter(Product.user_id == user.id)
     if status:
         query = query.filter(ImportItem.status == status)
     return query.order_by(Product.id.desc()).all()
@@ -125,6 +133,97 @@ def mock_enrich_product(product_id: int, db: Session = Depends(get_db)):
     return product
 
 
+@router.post("/{product_id}/ai-enrich", response_model=EnrichmentResult)
+def ai_enrich_product(
+    product_id: int,
+    provider: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    product = (
+        db.query(Product)
+        .options(joinedload(Product.compatibilities), joinedload(Product.attributes))
+        .filter(Product.id == product_id)
+        .first()
+    )
+    if not product:
+        raise HTTPException(status_code=404, detail="Produto não encontrado")
+
+    import_item = db.query(ImportItem).filter(ImportItem.id == product.import_item_id).first()
+    if import_item:
+        import_item.status = ItemStatus.enriching
+        db.commit()
+
+    try:
+        result = ai_enrich(product, db, provider_id=provider)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:
+        if import_item:
+            import_item.status = ItemStatus.imported
+            db.commit()
+        raise HTTPException(status_code=500, detail=f"Erro no enriquecimento IA: {exc}") from exc
+
+    return result
+
+
+@router.post("/bulk-enrich")
+def bulk_ai_enrich(batch_id: int = Query(...), db: Session = Depends(get_db)):
+    """Enriquece todos os produtos não-enriquecidos de um batch."""
+    items = (
+        db.query(ImportItem)
+        .filter(ImportItem.batch_id == batch_id)
+        .filter(ImportItem.status.in_([ItemStatus.imported, ItemStatus.normalized]))
+        .all()
+    )
+
+    if not items:
+        raise HTTPException(status_code=404, detail="Nenhum item pendente para enriquecer neste lote")
+
+    results = []
+    errors = []
+    for item in items:
+        product = db.query(Product).filter(Product.import_item_id == item.id).first()
+        if not product:
+            continue
+        try:
+            result = ai_enrich(product, db)
+            results.append(result)
+        except Exception as exc:
+            errors.append({"oem": product.oem, "error": str(exc)})
+
+    return {
+        "enriched": len(results),
+        "errors": len(errors),
+        "error_details": errors,
+        "results": results,
+    }
+
+
+@router.get("/{product_id}/pricing/info")
+def get_pricing_info(product_id: int, db: Session = Depends(get_db)):
+    """Retorna dados de pricing existentes + preço Honda da KB."""
+    product = db.query(Product).filter(Product.id == product_id).first()
+    if not product:
+        raise HTTPException(status_code=404, detail="Produto não encontrado")
+
+    honda_price = None
+    kb_entries = lookup_kb(product.oem, db)
+    if kb_entries:
+        honda_price = _get_honda_price(kb_entries)
+
+    pricing = product.pricing
+    return {
+        "honda_price": honda_price,
+        "cost": float(pricing.cost) if pricing else honda_price,
+        "estimated_shipping": float(pricing.estimated_shipping) if pricing else 0,
+        "commission_percent": float(pricing.commission_percent) if pricing else 0.16,
+        "fixed_fee": float(pricing.fixed_fee) if pricing else 0,
+        "margin_percent": float(pricing.margin_percent) if pricing else 0.20,
+        "suggested_price": float(pricing.suggested_price) if pricing and pricing.suggested_price else None,
+        "final_price": float(pricing.final_price) if pricing and pricing.final_price else None,
+    }
+
+
 @router.post("/{product_id}/pricing/calculate", response_model=PricingOut)
 def calculate_pricing(product_id: int, payload: PricingRequest, db: Session = Depends(get_db)):
     product = db.query(Product).filter(Product.id == product_id).first()
@@ -191,7 +290,11 @@ async def upload_product_images(
                 detail=f"Imagem {file.filename} excede o limite de {settings.max_image_size_mb}MB",
             )
 
-        ext = os.path.splitext(file.filename or "img.jpg")[1] or ".jpg"
+        # Extrai extensão segura (sem path traversal)
+        safe_original = Path(file.filename or "img.jpg").name
+        ext = os.path.splitext(safe_original)[1] or ".jpg"
+        if ext.lower() not in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
+            raise HTTPException(status_code=400, detail=f"Extensão não permitida: {ext}")
         filename = f"{product.oem}_original_{next_index}{ext}"
         file_path = upload_dir / filename
 
@@ -220,4 +323,61 @@ async def upload_product_images(
     return {
         "message": "Imagens salvas com sucesso",
         "files": uploaded,
+    }
+
+
+@router.post("/{product_id}/images/process-background")
+def process_images_background(product_id: int, db: Session = Depends(get_db)):
+    """Remove o fundo de todas as imagens originais e gera versões com fundo branco."""
+    product = (
+        db.query(Product)
+        .options(joinedload(Product.images))
+        .filter(Product.id == product_id)
+        .first()
+    )
+    if not product:
+        raise HTTPException(status_code=404, detail="Produto não encontrado")
+
+    originals = [img for img in product.images if img.image_type == ImageType.original]
+    if not originals:
+        raise HTTPException(status_code=400, detail="Nenhuma imagem original encontrada. Faça upload primeiro.")
+
+    # Remove imagens processadas anteriores
+    old_processed = [img for img in product.images if img.image_type == ImageType.processed]
+    for old in old_processed:
+        if old.storage_path and Path(old.storage_path).exists():
+            Path(old.storage_path).unlink()
+        db.delete(old)
+
+    processed = []
+    errors = []
+    upload_dir = _ensure_upload_dir(product.oem)
+
+    for img in originals:
+        output_filename = f"{product.oem}_processed_{img.sort_order}.jpg"
+        output_path = str(upload_dir / output_filename)
+
+        try:
+            remove_background(img.storage_path, output_path)
+
+            processed_img = Image(
+                product_id=product.id,
+                image_type=ImageType.processed,
+                sort_order=img.sort_order,
+                filename=output_filename,
+                storage_path=output_path,
+                mime_type="image/jpeg",
+                status="processed",
+            )
+            db.add(processed_img)
+            processed.append(output_filename)
+        except RuntimeError as exc:
+            errors.append({"file": img.filename, "error": str(exc)})
+
+    db.commit()
+
+    return {
+        "message": f"{len(processed)} imagem(ns) processada(s) com fundo branco",
+        "processed": processed,
+        "errors": errors,
     }

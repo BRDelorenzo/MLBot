@@ -5,8 +5,10 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.database import Base, engine
+from app.routers.auth_users import router as auth_users_router
 from app.routers.auth_ml import router as auth_ml_router
 from app.routers.batches import router as batches_router
+from app.routers.knowledge_base import router as kb_router
 from app.routers.listings import router as listings_router
 from app.routers.products import router as products_router
 from app.services.mercadolivre import MLAPIError
@@ -24,10 +26,12 @@ BASE_DIR = Path(__file__).resolve().parent
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 
 # Routers
+app.include_router(auth_users_router)
 app.include_router(auth_ml_router)
 app.include_router(batches_router)
 app.include_router(products_router)
 app.include_router(listings_router)
+app.include_router(kb_router)
 
 
 @app.exception_handler(MLAPIError)

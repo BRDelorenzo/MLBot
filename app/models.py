@@ -60,19 +60,25 @@ class User(Base):
     email = Column(String(255), unique=True, index=True, nullable=False)
     password_hash = Column(String(255), nullable=False)
     role = Column(SAEnum(UserRole), default=UserRole.operator, nullable=False)
+    is_active = Column(Integer, default=1, nullable=False)
     created_at = Column(DateTime, default=_utcnow)
+
+    batches = relationship("ImportBatch", back_populates="user")
+    ml_credentials = relationship("MLCredential", back_populates="user")
 
 
 class ImportBatch(Base):
     __tablename__ = "import_batches"
 
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=True)
     filename = Column(String(255), nullable=False)
     total_items = Column(Integer, default=0, nullable=False)
     total_valid = Column(Integer, default=0, nullable=False)
     total_invalid = Column(Integer, default=0, nullable=False)
     created_at = Column(DateTime, default=_utcnow)
 
+    user = relationship("User", back_populates="batches")
     items = relationship("ImportItem", back_populates="batch", cascade="all, delete-orphan")
 
 
@@ -95,8 +101,9 @@ class Product(Base):
     __tablename__ = "products"
 
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=True)
     import_item_id = Column(Integer, ForeignKey("import_items.id"), unique=True, nullable=False)
-    oem = Column(String(120), unique=True, index=True, nullable=False)
+    oem = Column(String(120), index=True, nullable=False)
     part_name = Column(String(255), nullable=True)
     brand = Column(String(120), nullable=True)
     category = Column(String(120), nullable=True)
@@ -192,11 +199,64 @@ class Listing(Base):
     product = relationship("Product", back_populates="listing")
 
 
+class KBDocumentStatus(StrEnum):
+    pending = "pending"
+    processing = "processing"
+    processed = "processed"
+    error = "error"
+
+
+class KBDocument(Base):
+    __tablename__ = "kb_documents"
+
+    id = Column(Integer, primary_key=True, index=True)
+    filename = Column(String(255), nullable=False)
+    storage_path = Column(String(500), nullable=False)
+    document_type = Column(String(80), default="parts_catalog", nullable=False)
+    brand = Column(String(120), default="Honda", nullable=False)
+    page_count = Column(Integer, nullable=True)
+    status = Column(SAEnum(KBDocumentStatus), default=KBDocumentStatus.pending, nullable=False)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=_utcnow)
+
+    entries = relationship("KBEntry", back_populates="document", cascade="all, delete-orphan")
+
+
+class KBEntry(Base):
+    __tablename__ = "kb_entries"
+
+    id = Column(Integer, primary_key=True, index=True)
+    document_id = Column(Integer, ForeignKey("kb_documents.id"), index=True, nullable=False)
+    oem_code = Column(String(120), nullable=False)
+    oem_code_normalized = Column(String(120), index=True, nullable=False)
+    honda_part_name = Column(String(500), nullable=True)
+    honda_price = Column(Numeric(10, 2), nullable=True)
+    section_context = Column(Text, nullable=True)
+    page_number = Column(Integer, nullable=True)
+    raw_text_block = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=_utcnow)
+
+    document = relationship("KBDocument", back_populates="entries")
+    compatibilities = relationship("KBCompatibility", back_populates="entry", cascade="all, delete-orphan")
+
+
+class KBCompatibility(Base):
+    __tablename__ = "kb_compatibilities"
+
+    id = Column(Integer, primary_key=True, index=True)
+    entry_id = Column(Integer, ForeignKey("kb_entries.id"), index=True, nullable=False)
+    motorcycle_model = Column(String(255), nullable=False)
+    year_info = Column(String(120), nullable=True)
+    raw_text = Column(String(500), nullable=True)
+
+    entry = relationship("KBEntry", back_populates="compatibilities")
+
+
 class MLCredential(Base):
     __tablename__ = "ml_credentials"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, nullable=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=True)
     ml_user_id = Column(String(80), nullable=True)
     access_token_encrypted = Column(Text, nullable=False)
     refresh_token_encrypted = Column(Text, nullable=False)
@@ -204,5 +264,8 @@ class MLCredential(Base):
     expires_at = Column(DateTime, nullable=False)
     scope = Column(String(255), nullable=True)
     pkce_verifier = Column(String(255), nullable=True)
+    oauth_state = Column(String(128), nullable=True)
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    user = relationship("User", back_populates="ml_credentials")

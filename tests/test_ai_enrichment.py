@@ -94,8 +94,8 @@ def test_ai_enrich_with_kb(mock_call_llm, client, db):
 
 def test_ai_enrich_no_api_key(client):
     """Sem nenhum provider configurado deve dar erro."""
-    from app.services.ai_enrichment import _provider_configs
-    _provider_configs.clear()
+    from app.services.ai_enrichment import _provider_cache
+    _provider_cache.clear()
 
     pid = _create_product(client, "NOKEY-001")
     resp = client.post(f"/products/{pid}/ai-enrich")

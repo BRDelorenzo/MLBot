@@ -1,9 +1,8 @@
 """Serviço de autenticação — registro, login, JWT."""
 
-import secrets
 from datetime import UTC, datetime, timedelta
-from hashlib import sha256
 
+import bcrypt
 import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -26,15 +25,19 @@ def _get_jwt_secret() -> str:
 
 
 def hash_password(password: str) -> str:
-    """Hash simples com SHA-256 + salt. Para produção, usar bcrypt."""
-    salt = secrets.token_hex(16)
-    h = sha256(f"{salt}{password}".encode()).hexdigest()
-    return f"{salt}:{h}"
+    """Hash seguro com bcrypt (cost factor 12)."""
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12)).decode()
 
 
 def verify_password(password: str, password_hash: str) -> bool:
-    salt, h = password_hash.split(":", 1)
-    return sha256(f"{salt}{password}".encode()).hexdigest() == h
+    # Suporte a hashes legados SHA-256 (salt:hex) para migração
+    if ":" in password_hash and len(password_hash) == 97:
+        from hashlib import sha256
+        salt, h = password_hash.split(":", 1)
+        if sha256(f"{salt}{password}".encode()).hexdigest() == h:
+            return True
+        return False
+    return bcrypt.checkpw(password.encode(), password_hash.encode())
 
 
 def create_token(user: User) -> str:

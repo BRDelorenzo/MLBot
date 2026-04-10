@@ -65,36 +65,84 @@ class ProviderConfig:
     model: str = ""
 
 
-# Armazena as configs em memória (runtime)
-_provider_configs: dict[str, ProviderConfig] = {}
+# Cache em memória (carregado do banco)
+_provider_cache: dict[str, ProviderConfig] = {}
 
 
-def get_provider_config(provider_id: str) -> ProviderConfig:
-    return _provider_configs.get(provider_id, ProviderConfig())
+def _load_provider_from_db(provider_id: str, db: Session) -> ProviderConfig | None:
+    """Carrega config do banco e descriptografa a API key."""
+    from app.models import AIProviderConfig
+    from app.services.crypto import decrypt
+
+    row = db.query(AIProviderConfig).filter(AIProviderConfig.provider_id == provider_id).first()
+    if not row:
+        return None
+    cfg = ProviderConfig(api_key=decrypt(row.api_key_encrypted), model=row.model)
+    _provider_cache[provider_id] = cfg
+    return cfg
 
 
-def set_provider_config(provider_id: str, api_key: str, model: str | None = None):
+def get_provider_config(provider_id: str, db: Session | None = None) -> ProviderConfig:
+    cached = _provider_cache.get(provider_id)
+    if cached and cached.api_key:
+        return cached
+    if db:
+        loaded = _load_provider_from_db(provider_id, db)
+        if loaded:
+            return loaded
+    return ProviderConfig()
+
+
+def set_provider_config(provider_id: str, api_key: str, model: str | None = None, db: Session | None = None):
     if provider_id not in PROVIDERS:
         raise ValueError(f"Provider desconhecido: {provider_id}")
     if not model:
         model = PROVIDERS[provider_id]["default_model"]
-    _provider_configs[provider_id] = ProviderConfig(api_key=api_key, model=model)
+
+    cfg = ProviderConfig(api_key=api_key, model=model)
+    _provider_cache[provider_id] = cfg
+
+    if db:
+        from app.models import AIProviderConfig
+        from app.services.crypto import encrypt
+
+        row = db.query(AIProviderConfig).filter(AIProviderConfig.provider_id == provider_id).first()
+        if row:
+            row.api_key_encrypted = encrypt(api_key)
+            row.model = model
+        else:
+            db.add(AIProviderConfig(
+                provider_id=provider_id,
+                api_key_encrypted=encrypt(api_key),
+                model=model,
+            ))
+        db.commit()
 
 
-def get_active_provider() -> tuple[str, ProviderConfig] | None:
+def remove_provider_config(provider_id: str, db: Session | None = None):
+    _provider_cache.pop(provider_id, None)
+    if db:
+        from app.models import AIProviderConfig
+        row = db.query(AIProviderConfig).filter(AIProviderConfig.provider_id == provider_id).first()
+        if row:
+            db.delete(row)
+            db.commit()
+
+
+def get_active_provider(db: Session | None = None) -> tuple[str, ProviderConfig] | None:
     """Retorna o primeiro provider configurado com API key."""
     for pid in ("anthropic", "openai", "gemini"):
-        cfg = _provider_configs.get(pid)
+        cfg = get_provider_config(pid, db)
         if cfg and cfg.api_key:
             return pid, cfg
     return None
 
 
-def get_all_provider_status() -> list[dict]:
+def get_all_provider_status(db: Session | None = None) -> list[dict]:
     """Retorna status de todos os providers."""
     result = []
     for pid, info in PROVIDERS.items():
-        cfg = get_provider_config(pid)
+        cfg = get_provider_config(pid, db)
         has_key = bool(cfg.api_key)
         masked = ""
         if has_key:
@@ -339,11 +387,11 @@ def enrich_product(product: Product, db: Session, provider_id: str | None = None
     """
     # Resolve provider
     if provider_id:
-        cfg = get_provider_config(provider_id)
+        cfg = get_provider_config(provider_id, db)
         if not cfg.api_key:
             raise RuntimeError(f"API Key do provider '{provider_id}' não configurada. Vá em Base de Conhecimento > Configuração da IA.")
     else:
-        active = get_active_provider()
+        active = get_active_provider(db)
         if not active:
             raise RuntimeError(
                 "Nenhuma API Key configurada. "
@@ -365,21 +413,23 @@ def enrich_product(product: Product, db: Session, provider_id: str | None = None
     logger.info("Enriquecendo produto %d (OEM: %s) via %s [%s]", product.id, product.oem, provider_name, cfg.model)
     enrichment = call_llm(provider_id, cfg, SYSTEM_PROMPT, user_prompt)
 
-    # 4. Aplica no produto
-    _apply_enrichment(product, enrichment, source, db)
-
-    # 5. Auto-pricing se tiver preço Honda na KB
+    # 4-6. Aplica tudo em transação atômica
     honda_price = _get_honda_price(kb_entries)
-    if honda_price:
-        _auto_pricing(product, honda_price, db)
+    try:
+        _apply_enrichment(product, enrichment, source, db)
 
-    # 6. Atualiza status do import item
-    import_item = db.query(ImportItem).filter(ImportItem.id == product.import_item_id).first()
-    if import_item:
-        import_item.status = ItemStatus.awaiting_review
+        if honda_price:
+            _auto_pricing(product, honda_price, db)
 
-    db.commit()
-    db.refresh(product)
+        import_item = db.query(ImportItem).filter(ImportItem.id == product.import_item_id).first()
+        if import_item:
+            import_item.status = ItemStatus.awaiting_review
+
+        db.commit()
+        db.refresh(product)
+    except Exception:
+        db.rollback()
+        raise
 
     return {
         "product_id": product.id,

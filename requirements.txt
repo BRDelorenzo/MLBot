@@ -9,6 +9,7 @@ cryptography>=44.0,<45
 
 # Auth
 PyJWT>=2.0,<3
+bcrypt>=4.0,<6
 pydantic[email]
 
 # AI / Knowledge Base

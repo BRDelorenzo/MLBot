@@ -1,12 +1,13 @@
 """Endpoints de autenticação de usuários — registro e login."""
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.services.auth import authenticate_user, create_token, get_current_user, register_user
 from app.models import User
+from app.services.auth import authenticate_user, create_token, get_current_user, register_user
+from app.services.rate_limit import get_client_ip, login_limiter, register_limiter
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -35,7 +36,8 @@ class UserOut(BaseModel):
 
 
 @router.post("/register", response_model=AuthResponse)
-def register(payload: RegisterRequest, db: Session = Depends(get_db)):
+def register(payload: RegisterRequest, request: Request, db: Session = Depends(get_db)):
+    register_limiter.check(get_client_ip(request))
     user = register_user(payload.name, payload.email, payload.password, db)
     token = create_token(user)
     return {
@@ -45,7 +47,8 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/login", response_model=AuthResponse)
-def login(payload: LoginRequest, db: Session = Depends(get_db)):
+def login(payload: LoginRequest, request: Request, db: Session = Depends(get_db)):
+    login_limiter.check(get_client_ip(request))
     user = authenticate_user(payload.email, payload.password, db)
     token = create_token(user)
     return {

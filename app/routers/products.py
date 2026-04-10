@@ -12,6 +12,7 @@ from app.models import (
     ImageType,
     ImportItem,
     ItemStatus,
+    Listing,
     Product,
     ProductAttribute,
     ProductCompatibility,
@@ -21,7 +22,7 @@ from app.models import (
 from app.models import _utcnow as utcnow
 from app.schemas import EnrichmentResult, PricingOut, PricingRequest, ProductOut, ProductUpdateIn
 from app.services.ai_enrichment import enrich_product as ai_enrich, lookup_kb, _get_honda_price
-from app.services.auth import get_optional_user
+from app.services.auth import get_current_user, get_optional_user
 from app.services.image_processing import remove_background
 
 router = APIRouter(prefix="/products", tags=["products"])
@@ -57,7 +58,14 @@ def list_products(
 ):
     query = (
         db.query(Product)
-        .options(joinedload(Product.compatibilities), joinedload(Product.attributes))
+        .options(
+            joinedload(Product.import_item),
+            joinedload(Product.compatibilities),
+            joinedload(Product.attributes),
+            joinedload(Product.images),
+            joinedload(Product.pricing),
+            joinedload(Product.listing),
+        )
         .join(ImportItem, Product.import_item_id == ImportItem.id)
     )
     if user:
@@ -71,7 +79,14 @@ def list_products(
 def get_product(product_id: int, db: Session = Depends(get_db)):
     product = (
         db.query(Product)
-        .options(joinedload(Product.compatibilities), joinedload(Product.attributes))
+        .options(
+            joinedload(Product.import_item),
+            joinedload(Product.compatibilities),
+            joinedload(Product.attributes),
+            joinedload(Product.images),
+            joinedload(Product.pricing),
+            joinedload(Product.listing),
+        )
         .filter(Product.id == product_id)
         .first()
     )
@@ -81,7 +96,7 @@ def get_product(product_id: int, db: Session = Depends(get_db)):
 
 
 @router.patch("/{product_id}", response_model=ProductOut)
-def update_product(product_id: int, payload: ProductUpdateIn, db: Session = Depends(get_db)):
+def update_product(product_id: int, payload: ProductUpdateIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     product = db.query(Product).filter(Product.id == product_id).first()
     if not product:
         raise HTTPException(status_code=404, detail="Produto não encontrado")
@@ -96,7 +111,7 @@ def update_product(product_id: int, payload: ProductUpdateIn, db: Session = Depe
 
 
 @router.post("/{product_id}/mock-enrich", response_model=ProductOut)
-def mock_enrich_product(product_id: int, db: Session = Depends(get_db)):
+def mock_enrich_product(product_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     product = db.query(Product).filter(Product.id == product_id).first()
     if not product:
         raise HTTPException(status_code=404, detail="Produto não encontrado")
@@ -138,6 +153,7 @@ def ai_enrich_product(
     product_id: int,
     provider: str | None = Query(default=None),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     product = (
         db.query(Product)
@@ -167,7 +183,7 @@ def ai_enrich_product(
 
 
 @router.post("/bulk-enrich")
-def bulk_ai_enrich(batch_id: int = Query(...), db: Session = Depends(get_db)):
+def bulk_ai_enrich(batch_id: int = Query(...), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Enriquece todos os produtos não-enriquecidos de um batch."""
     items = (
         db.query(ImportItem)
@@ -225,7 +241,7 @@ def get_pricing_info(product_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/{product_id}/pricing/calculate", response_model=PricingOut)
-def calculate_pricing(product_id: int, payload: PricingRequest, db: Session = Depends(get_db)):
+def calculate_pricing(product_id: int, payload: PricingRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     product = db.query(Product).filter(Product.id == product_id).first()
     if not product:
         raise HTTPException(status_code=404, detail="Produto não encontrado")
@@ -254,6 +270,13 @@ def calculate_pricing(product_id: int, payload: PricingRequest, db: Session = De
     pricing.suggested_price = suggested_price
     pricing.final_price = suggested_price
 
+    import_item = db.query(ImportItem).filter(ImportItem.id == product.import_item_id).first()
+    if import_item and import_item.status in (
+        ItemStatus.enriched,
+        ItemStatus.awaiting_review,
+    ):
+        import_item.status = ItemStatus.awaiting_photos
+
     db.commit()
     db.refresh(pricing)
     return pricing
@@ -264,6 +287,7 @@ async def upload_product_images(
     product_id: int,
     files: list[UploadFile] = File(..., description="Imagens do produto"),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     product = db.query(Product).filter(Product.id == product_id).first()
     if not product:
@@ -284,6 +308,18 @@ async def upload_product_images(
             raise HTTPException(status_code=400, detail=f"Arquivo inválido: {file.filename}")
 
         content = await file.read()
+
+        # Valida magic bytes da imagem
+        _IMAGE_SIGNATURES = {
+            b"\xff\xd8\xff": "image/jpeg",
+            b"\x89PNG\r\n\x1a\n": "image/png",
+            b"RIFF": "image/webp",  # WebP starts with RIFF
+            b"GIF87a": "image/gif",
+            b"GIF89a": "image/gif",
+        }
+        if not any(content[:8].startswith(sig) for sig in _IMAGE_SIGNATURES):
+            raise HTTPException(status_code=400, detail=f"Arquivo {file.filename} não é uma imagem válida (magic bytes inválidos)")
+
         if len(content) > MAX_IMAGE_BYTES:
             raise HTTPException(
                 status_code=400,
@@ -327,7 +363,7 @@ async def upload_product_images(
 
 
 @router.post("/{product_id}/images/process-background")
-def process_images_background(product_id: int, db: Session = Depends(get_db)):
+def process_images_background(product_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Remove o fundo de todas as imagens originais e gera versões com fundo branco."""
     product = (
         db.query(Product)
@@ -373,6 +409,14 @@ def process_images_background(product_id: int, db: Session = Depends(get_db)):
             processed.append(output_filename)
         except RuntimeError as exc:
             errors.append({"file": img.filename, "error": str(exc)})
+
+    if processed:
+        import_item = db.query(ImportItem).filter(ImportItem.id == product.import_item_id).first()
+        if import_item and import_item.status in (
+            ItemStatus.photos_received,
+            ItemStatus.processing_images,
+        ):
+            import_item.status = ItemStatus.processed
 
     db.commit()
 

@@ -61,7 +61,21 @@
       "Bash([ -f .env ])",
       "Bash(python -m pytest tests/test_products.py::test_list_products_empty -v)",
       "Bash(taskkill //F //PID 16040)",
-      "Bash(taskkill //F //PID 12044)"
+      "Bash(taskkill //F //PID 12044)",
+      "Read(//c/Users/giovanni/Downloads/**)",
+      "Bash(taskkill //F //PID 29736)",
+      "Bash(taskkill //F //PID 30796)",
+      "Bash(python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000)",
+      "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(f\\\\\"status={d['status']} has_listing={d['has_listing']} has_pricing={d['has_pricing']}\\\\\"\\)\")",
+      "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(d.get\\('has_listing'\\), d.get\\('status'\\)\\)\")",
+      "Bash(taskkill //F //PID 31532)",
+      "Bash(taskkill //F //PID 30848)",
+      "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(f\\\\\"status={d['status']} has_listing={d['has_listing']}\\\\\"\\)\")",
+      "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(f\\\\\"status={d['status']}\\\\\"\\)\")",
+      "Bash(python -m pytest --tb=short -q)",
+      "Bash(python -c \"import bcrypt; print\\(bcrypt.__version__\\)\")",
+      "Bash(python -m pytest tests/ -x -q)",
+      "Bash(python -m pytest tests/test_ai_enrichment.py::test_ai_enrich_no_api_key -x -v)"
     ]
   }
 }

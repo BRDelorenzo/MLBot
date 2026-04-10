@@ -16,6 +16,16 @@ from app.services.crypto import decrypt, encrypt
 
 logger = logging.getLogger(__name__)
 
+# Singleton HTTP client com connection pooling
+_http_client: httpx.Client | None = None
+
+
+def _get_http_client(timeout: int = 30) -> httpx.Client:
+    global _http_client  # noqa: PLW0603
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.Client(timeout=timeout, limits=httpx.Limits(max_connections=20, max_keepalive_connections=10))
+    return _http_client
+
 
 def _utcnow() -> datetime:
     """UTC naive datetime — compatível com SQLite."""
@@ -85,8 +95,8 @@ def exchange_code_for_token(code: str, db: Session, state: str | None = None) ->
         "code_verifier": code_verifier,
     }
 
-    with httpx.Client(timeout=30) as client:
-        resp = client.post(f"{settings.ml_api_base_url}/oauth/token", json=payload)
+    client = _get_http_client()
+    resp = client.post(f"{settings.ml_api_base_url}/oauth/token", json=payload)
 
     if resp.status_code != 200:
         raise MLAPIError(resp.status_code, f"Erro ao obter token: {resp.text}")
@@ -118,8 +128,8 @@ def _refresh_token(credential: MLCredential, db: Session) -> MLCredential:
         "refresh_token": current_refresh_token,
     }
 
-    with httpx.Client(timeout=30) as client:
-        resp = client.post(f"{settings.ml_api_base_url}/oauth/token", json=payload)
+    client = _get_http_client()
+    resp = client.post(f"{settings.ml_api_base_url}/oauth/token", json=payload)
 
     if resp.status_code != 200:
         raise MLAPIError(resp.status_code, f"Erro ao renovar token: {resp.text}")
@@ -158,12 +168,12 @@ def upload_image(access_token: str, file_path: str) -> str:
 
     with open(file_path, "rb") as f:
         files = {"file": (file_path.split("/")[-1].split("\\")[-1], f, mime_type)}
-        with httpx.Client(timeout=60) as client:
-            resp = client.post(
-                f"{settings.ml_api_base_url}/pictures/items/upload",
-                files=files,
-                headers=_auth_headers(access_token),
-            )
+        client = _get_http_client()
+        resp = client.post(
+            f"{settings.ml_api_base_url}/pictures/items/upload",
+            files=files,
+            headers=_auth_headers(access_token),
+        )
 
     if resp.status_code not in (200, 201):
         raise MLAPIError(resp.status_code, f"Erro ao fazer upload da imagem: {resp.text}")
@@ -201,8 +211,8 @@ def publish_item(
         "attributes": attributes or [],
     }
 
-    with httpx.Client(timeout=30) as client:
-        resp = client.post(
+    client = _get_http_client()
+    resp = client.post(
             f"{settings.ml_api_base_url}/items",
             json=body,
             headers=_auth_headers(access_token),
@@ -214,12 +224,12 @@ def publish_item(
     result = resp.json()
 
     if description:
-        with httpx.Client(timeout=30) as client:
-            desc_resp = client.post(
-                f"{settings.ml_api_base_url}/items/{result['id']}/description",
-                json={"plain_text": description},
-                headers=_auth_headers(access_token),
-            )
+        client = _get_http_client()
+        desc_resp = client.post(
+            f"{settings.ml_api_base_url}/items/{result['id']}/description",
+            json={"plain_text": description},
+            headers=_auth_headers(access_token),
+        )
         if desc_resp.status_code not in (200, 201):
             logger.warning("Falha ao enviar descrição para item %s: %s", result["id"], desc_resp.text)
 
@@ -227,11 +237,11 @@ def publish_item(
 
 
 def predict_category(title: str) -> dict:
-    with httpx.Client(timeout=30) as client:
-        resp = client.get(
-            f"{settings.ml_api_base_url}/sites/{settings.ml_site_id}/domain_discovery/search",
-            params={"q": title},
-        )
+    client = _get_http_client()
+    resp = client.get(
+        f"{settings.ml_api_base_url}/sites/{settings.ml_site_id}/domain_discovery/search",
+        params={"q": title},
+    )
 
     if resp.status_code != 200 or not resp.json():
         raise MLAPIError(resp.status_code, f"Não foi possível prever categoria para: {title}")
@@ -246,8 +256,8 @@ def predict_category(title: str) -> dict:
 
 
 def get_categories() -> list[dict]:
-    with httpx.Client(timeout=30) as client:
-        resp = client.get(f"{settings.ml_api_base_url}/sites/{settings.ml_site_id}/categories")
+    client = _get_http_client()
+    resp = client.get(f"{settings.ml_api_base_url}/sites/{settings.ml_site_id}/categories")
 
     if resp.status_code != 200:
         raise MLAPIError(resp.status_code, f"Erro ao buscar categorias: {resp.text}")
@@ -256,8 +266,8 @@ def get_categories() -> list[dict]:
 
 
 def get_category_attributes(category_id: str) -> list[dict]:
-    with httpx.Client(timeout=30) as client:
-        resp = client.get(f"{settings.ml_api_base_url}/categories/{category_id}/attributes")
+    client = _get_http_client()
+    resp = client.get(f"{settings.ml_api_base_url}/categories/{category_id}/attributes")
 
     if resp.status_code != 200:
         raise MLAPIError(resp.status_code, f"Erro ao buscar atributos: {resp.text}")

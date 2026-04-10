@@ -7,7 +7,8 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import get_db
-from app.models import KBDocument, KBDocumentStatus, KBEntry
+from app.models import KBDocument, KBDocumentStatus, KBEntry, User
+from app.services.auth import get_current_user
 from app.routers.batches import normalize_oem
 from app.schemas import KBDocumentOut, KBEntryOut, KBSearchResult
 from app.services.kb_parser import process_kb_document
@@ -41,6 +42,7 @@ async def upload_kb_document(
     brand: str = Query(default="Honda"),
     document_type: str = Query(default="parts_catalog"),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Envie um arquivo PDF")
@@ -115,7 +117,7 @@ def get_kb_document(document_id: int, db: Session = Depends(get_db)):
 
 
 @router.delete("/documents/{document_id}")
-def delete_kb_document(document_id: int, db: Session = Depends(get_db)):
+def delete_kb_document(document_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     document = db.query(KBDocument).filter(KBDocument.id == document_id).first()
     if not document:
         raise HTTPException(status_code=404, detail="Documento não encontrado")
@@ -192,10 +194,10 @@ def kb_stats(db: Session = Depends(get_db)):
 
 
 @router.get("/ai-providers")
-def list_ai_providers():
+def list_ai_providers(db: Session = Depends(get_db)):
     """Retorna status de todos os providers de IA."""
     from app.services.ai_enrichment import get_all_provider_status
-    return get_all_provider_status()
+    return get_all_provider_status(db)
 
 
 @router.post("/ai-providers/{provider_id}")
@@ -203,6 +205,8 @@ def configure_ai_provider(
     provider_id: str,
     api_key: str = Body(..., min_length=10, embed=True),
     model: str | None = Body(default=None, embed=True),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """Configura a API key e modelo de um provider."""
     from app.services.ai_enrichment import PROVIDERS, get_provider_config, set_provider_config
@@ -210,8 +214,8 @@ def configure_ai_provider(
     if provider_id not in PROVIDERS:
         raise HTTPException(status_code=400, detail=f"Provider desconhecido: {provider_id}")
 
-    set_provider_config(provider_id, api_key, model)
-    cfg = get_provider_config(provider_id)
+    set_provider_config(provider_id, api_key, model, db)
+    cfg = get_provider_config(provider_id, db)
     k = cfg.api_key
     masked = k[:4] + "..." + k[-4:] if len(k) > 12 else "***"
     return {
@@ -223,14 +227,14 @@ def configure_ai_provider(
 
 
 @router.delete("/ai-providers/{provider_id}")
-def remove_ai_provider(provider_id: str):
+def remove_ai_provider(provider_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Remove a API key de um provider."""
-    from app.services.ai_enrichment import PROVIDERS, _provider_configs
+    from app.services.ai_enrichment import PROVIDERS, remove_provider_config
 
     if provider_id not in PROVIDERS:
         raise HTTPException(status_code=400, detail=f"Provider desconhecido: {provider_id}")
 
-    _provider_configs.pop(provider_id, None)
+    remove_provider_config(provider_id, db)
     return {"provider": provider_id, "configured": False}
 
 

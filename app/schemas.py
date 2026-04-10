@@ -2,7 +2,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.models import ItemStatus, KBDocumentStatus, ListingStatus, UserRole
+from app.models import ImageType, ItemStatus, KBDocumentStatus, ListingStatus, UserRole
 
 
 class UserOut(BaseModel):
@@ -54,6 +54,16 @@ class AttributeOut(BaseModel):
     value: str
 
 
+class ImageOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    image_type: ImageType
+    sort_order: int
+    filename: str
+    status: str | None = None
+
+
 class ProductOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -65,8 +75,12 @@ class ProductOut(BaseModel):
     technical_description: str | None
     confidence_level: int | None
     source_data: str | None
+    status: str | None = None
+    has_pricing: bool = False
+    has_listing: bool = False
     compatibilities: list[CompatibilityOut] = []
     attributes: list[AttributeOut] = []
+    images: list[ImageOut] = []
 
 
 class ProductUpdateIn(BaseModel):

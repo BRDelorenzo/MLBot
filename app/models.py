@@ -121,6 +121,18 @@ class Product(Base):
     listing = relationship("Listing", back_populates="product", uselist=False, cascade="all, delete-orphan")
     pricing = relationship("ProductPricing", back_populates="product", uselist=False, cascade="all, delete-orphan")
 
+    @property
+    def status(self):
+        return self.import_item.status if self.import_item else None
+
+    @property
+    def has_pricing(self):
+        return self.pricing is not None and self.pricing.suggested_price is not None
+
+    @property
+    def has_listing(self):
+        return self.listing is not None and self.listing.title is not None
+
 
 class ProductCompatibility(Base):
     __tablename__ = "product_compatibilities"
@@ -250,6 +262,16 @@ class KBCompatibility(Base):
     raw_text = Column(String(500), nullable=True)
 
     entry = relationship("KBEntry", back_populates="compatibilities")
+
+
+class AIProviderConfig(Base):
+    __tablename__ = "ai_provider_configs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    provider_id = Column(String(50), unique=True, nullable=False)
+    api_key_encrypted = Column(Text, nullable=False)
+    model = Column(String(120), nullable=False)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
 
 class MLCredential(Base):

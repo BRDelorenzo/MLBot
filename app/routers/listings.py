@@ -4,7 +4,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import ImportItem, ItemStatus, Listing, ListingStatus, Product
+from app.models import ImportItem, ItemStatus, Listing, ListingStatus, Product, User
+from app.services.auth import get_current_user
 from app.schemas import ListingOut, MLPublishResult, ValidationResponse
 from app.services.ai_enrichment import lookup_kb
 from app.services.mercadolivre import MLAPIError, get_category_attributes, get_valid_token, predict_category, publish_item, upload_image
@@ -131,7 +132,7 @@ Importante:
 
 
 @router.post("/{product_id}/listing/generate", response_model=ListingOut)
-def generate_listing(product_id: int, db: Session = Depends(get_db)):
+def generate_listing(product_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     product = db.query(Product).filter(Product.id == product_id).first()
     if not product:
         raise HTTPException(status_code=404, detail="Produto não encontrado")
@@ -198,13 +199,22 @@ def generate_listing(product_id: int, db: Session = Depends(get_db)):
     listing.price = float(product.pricing.final_price) if product.pricing and product.pricing.final_price else None
     listing.status = ListingStatus.draft
 
+    import_item = db.query(ImportItem).filter(ImportItem.id == product.import_item_id).first()
+    if import_item and import_item.status not in (
+        ItemStatus.validating,
+        ItemStatus.ready_to_publish,
+        ItemStatus.publishing,
+        ItemStatus.published,
+    ):
+        import_item.status = ItemStatus.validating
+
     db.commit()
     db.refresh(listing)
     return listing
 
 
 @router.post("/{product_id}/listing/validate", response_model=ValidationResponse)
-def validate_listing(product_id: int, db: Session = Depends(get_db)):
+def validate_listing(product_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     product = db.query(Product).filter(Product.id == product_id).first()
     if not product:
         raise HTTPException(status_code=404, detail="Produto não encontrado")
@@ -256,12 +266,12 @@ def validate_listing(product_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/{product_id}/listing/publish", response_model=MLPublishResult)
-def publish_listing(product_id: int, db: Session = Depends(get_db)):
+def publish_listing(product_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     product = db.query(Product).filter(Product.id == product_id).first()
     if not product or not product.listing:
         raise HTTPException(status_code=404, detail="Anúncio não encontrado")
 
-    if product.listing.status != ListingStatus.valid:
+    if product.listing.status not in (ListingStatus.valid, ListingStatus.publish_error):
         raise HTTPException(status_code=400, detail="Anúncio precisa estar validado antes da publicação")
 
     try:

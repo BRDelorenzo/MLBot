@@ -4,6 +4,17 @@
 
 const API = '';
 
+// --- XSS Protection ---
+function escapeHtml(str) {
+  if (str == null) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 // --- State ---
 let currentView = 'dashboard';
 let products = [];
@@ -88,12 +99,35 @@ function statusBadge(status) {
   return `<span class="badge badge-${variant}">${label}</span>`;
 }
 
+// --- Sidebar (mobile) ---
+function toggleSidebar() {
+  const sidebar = document.getElementById('sidebar');
+  const overlay = document.getElementById('sidebar-overlay');
+  const isOpen = sidebar.classList.contains('open');
+  if (isOpen) {
+    closeSidebar();
+  } else {
+    sidebar.classList.add('open');
+    overlay.classList.add('active');
+    requestAnimationFrame(() => overlay.classList.add('visible'));
+  }
+}
+
+function closeSidebar() {
+  const sidebar = document.getElementById('sidebar');
+  const overlay = document.getElementById('sidebar-overlay');
+  sidebar.classList.remove('open');
+  overlay.classList.remove('visible');
+  setTimeout(() => overlay.classList.remove('active'), 250);
+}
+
 // --- Navigation ---
 function navigate(view, data) {
   currentView = view;
   document.querySelectorAll('.nav-item').forEach(el => {
     el.classList.toggle('active', el.dataset.view === view);
   });
+  closeSidebar();
   renderView(view, data);
 }
 
@@ -104,7 +138,7 @@ function renderView(view, data) {
     case 'dashboard': renderDashboard(main); break;
     case 'import': renderImport(main); break;
     case 'products': renderProducts(main); break;
-    case 'product-detail': renderProductDetail(main, data); break;
+    case 'product-detail': navigate('products'); break;
     case 'kb': renderKnowledgeBase(main); break;
     case 'auth': renderAuth(main); break;
     default: main.innerHTML = '<div class="empty-state"><h3>Página não encontrada</h3></div>';
@@ -184,7 +218,7 @@ async function renderDashboard(el) {
                 ${batches.slice(0, 5).map(b => `
                   <tr onclick="loadBatchItems(${b.id})">
                     <td class="mono">#${b.id}</td>
-                    <td>${b.filename}</td>
+                    <td>${escapeHtml(b.filename)}</td>
                     <td>${b.total_items}</td>
                     <td>${b.total_valid}</td>
                     <td>${new Date(b.created_at).toLocaleDateString('pt-BR')}</td>
@@ -202,7 +236,7 @@ async function renderDashboard(el) {
       </div>
     `;
   } catch (err) {
-    el.innerHTML = `<div class="empty-state"><h3>Erro ao carregar</h3><p>${err.message}</p></div>`;
+    el.innerHTML = `<div class="empty-state"><h3>Erro ao carregar</h3><p>${escapeHtml(err.message)}</p></div>`;
   }
 }
 
@@ -255,7 +289,7 @@ async function handleFileUpload(input) {
     const data = await api('/batches/import', { method: 'POST', body: form, headers: {} });
     result.innerHTML = `
       <div class="card" style="background:var(--success-subtle);border-color:var(--success)">
-        <strong>${data.total_items} OEMs importados</strong> do arquivo ${data.filename}<br>
+        <strong>${data.total_items} OEMs importados</strong> do arquivo ${escapeHtml(data.filename)}<br>
         <span style="color:var(--text-secondary)">${data.total_valid} válidos · ${data.total_invalid} inválidos</span>
         <div class="mt-4">
           <button class="btn btn-primary btn-sm" onclick="navigate('products')">Ver Produtos</button>
@@ -264,446 +298,547 @@ async function handleFileUpload(input) {
     `;
     toast(`${data.total_items} OEMs importados com sucesso`, 'success');
   } catch (err) {
-    result.innerHTML = `<div class="card" style="border-color:var(--error);color:var(--error)">${err.message}</div>`;
+    result.innerHTML = `<div class="card" style="border-color:var(--error);color:var(--error)">${escapeHtml(err.message)}</div>`;
     toast(err.message, 'error');
   }
 }
 
-// --- Products List ---
-async function renderProducts(el) {
-  el.innerHTML = '<div class="view"><div class="spinner"></div></div>';
+// --- Pipeline Steps Definition ---
+const PIPELINE_STEPS = [
+  { id: 0, label: 'Enriquecer IA', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 3l1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5z"/><path d="M18 18l.5 1.5L20 20l-1.5.5L18 22l-.5-1.5L16 20l1.5-.5z"/></svg>' },
+  { id: 1, label: 'Preço', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6"/></svg>' },
+  { id: 2, label: 'Upload', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>' },
+  { id: 3, label: 'Fundo', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M15 4V2"/><path d="M15 16v-2"/><path d="M8 9h2"/><path d="M20 9h2"/><path d="M17.8 11.8L19 13"/><path d="M15 9h0"/><path d="M17.8 6.2L19 5"/><path d="M3 21l9-9"/><path d="M12.2 6.2L11 5"/></svg>' },
+  { id: 4, label: 'Anúncio', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>' },
+  { id: 5, label: 'Validar', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>' },
+  { id: 6, label: 'Publicar ML', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>' },
+];
 
-  try {
-    products = await api('/products');
+function statusToProgress(product) {
+  const s = product.status || '';
 
-    el.innerHTML = `
-      <div class="view">
-        <div class="page-header">
-          <div>
-            <h1>Produtos</h1>
-            <p>${products.length} produto${products.length !== 1 ? 's' : ''} no sistema</p>
-          </div>
-          <button class="btn btn-secondary" onclick="navigate('import')">Importar OEMs</button>
+  // Statuses terminais / avançados
+  if (s === 'published') return 7;
+  if (s === 'publishing' || s === 'ready_to_publish' || s === 'publish_error') return 6;
+  if (s === 'validating' || s === 'validation_error') return 5;
+  if (s === 'processed') {
+    // processed but might already have listing generated
+    return product.has_listing ? 5 : 4;
+  }
+  if (s === 'processing_images') return 3;
+  if (s === 'photos_received') return 3;
+  if (s === 'awaiting_photos') return 2;
+  if (s === 'enriched' || s === 'awaiting_review') {
+    return product.has_pricing ? 2 : 1;
+  }
+  if (s === 'enriching' || s === 'normalized' || s === 'imported') return 0;
+
+  // Fallback: infer from data when status is empty
+  const hasImages = (product.images || []).some(i => i.image_type === 'original');
+  const hasProcessed = (product.images || []).some(i => i.image_type === 'processed');
+  if (product.ml_item_id) return 7;
+  if (product.has_listing) return 5;
+  if (hasProcessed) return 4;
+  if (hasImages) return 3;
+  if (product.has_pricing) return 2;
+  if (product.part_name && product.brand && product.category) return 1;
+  return 0;
+}
+
+function confidenceClass(val) {
+  if (val == null || val === 0) return 'low';
+  if (val >= 80) return 'high';
+  if (val >= 50) return 'medium';
+  return 'low';
+}
+
+function renderProductCard(p) {
+  const progress = statusToProgress(p);
+  const isPublished = progress >= 7;
+  const confVal = p.confidence_level != null ? `${p.confidence_level}%` : '—';
+  const confClass = confidenceClass(p.confidence_level);
+
+  const stepsHtml = PIPELINE_STEPS.map((step, index) => {
+    const isCompleted = progress > step.id;
+    const isCurrent = progress === step.id;
+    const isPending = progress < step.id;
+
+    let btnClass = 'pipeline-btn';
+    if (isCompleted) btnClass += ' completed';
+    else if (isCurrent) btnClass += ' current';
+    else btnClass += ' pending';
+
+    const dotHtml = isCompleted ? '<span class="pipeline-done-dot"></span>' : '';
+    const onclick = (isCurrent || isCompleted) && !isPending
+      ? `onclick="event.stopPropagation();cardAction(${p.id}, ${step.id})"`
+      : '';
+    const disabled = isPending ? 'disabled' : '';
+    const btn = `<button class="${btnClass}" ${onclick} ${disabled} title="${step.label}">${step.icon}<span>${step.label}</span>${dotHtml}</button>`;
+
+    const connector = index < PIPELINE_STEPS.length - 1
+      ? `<span class="pipeline-connector ${isCompleted ? 'done' : 'pending'}"></span>`
+      : '';
+
+    return btn + connector;
+  }).join('');
+
+  return `
+    <div class="product-card ${isPublished ? 'published' : ''}" id="pcard-${p.id}">
+      <div class="product-card-info">
+        <div>
+          <div class="product-card-field-label">OEM</div>
+          <span class="product-card-oem">${escapeHtml(p.oem)}</span>
         </div>
-
-        ${products.length > 0 ? `
-        <div class="table-wrap">
-          <table>
-            <thead><tr>
-              <th>OEM</th><th>Peça</th><th>Marca</th><th>Categoria</th><th>Confiança</th><th>Ações</th>
-            </tr></thead>
-            <tbody>
-              ${products.map(p => `
-                <tr onclick="navigate('product-detail', ${p.id})">
-                  <td><span class="mono">${p.oem}</span></td>
-                  <td>${p.part_name || '<span style="color:var(--text-tertiary)">—</span>'}</td>
-                  <td>${p.brand || '—'}</td>
-                  <td>${p.category || '—'}</td>
-                  <td>${p.confidence_level != null ? `${p.confidence_level}%` : '—'}</td>
-                  <td><button class="btn btn-ghost btn-sm" onclick="event.stopPropagation();navigate('product-detail', ${p.id})">Abrir</button></td>
-                </tr>
-              `).join('')}
-            </tbody>
-          </table>
-        </div>` : `
-        <div class="empty-state">
-          <h3>Nenhum produto</h3>
-          <p>Importe OEMs para criar produtos automaticamente</p>
-          <button class="btn btn-primary mt-4" onclick="navigate('import')">Importar</button>
-        </div>`}
+        <div>
+          <div class="product-card-field-label">Peça</div>
+          <div class="product-card-field-value">${escapeHtml(p.part_name) || '—'}</div>
+        </div>
+        <div>
+          <div class="product-card-field-label">Marca</div>
+          <div class="product-card-field-value">${escapeHtml(p.brand) || '—'}</div>
+        </div>
+        <div>
+          <div class="product-card-field-label">Categoria</div>
+          <div class="product-card-field-value" style="color:var(--text-tertiary)">${escapeHtml(p.category) || '—'}</div>
+        </div>
+        <div>
+          <div class="product-card-field-label">Confiança</div>
+          <div class="product-card-field-value product-card-confidence ${confClass}">${confVal}</div>
+        </div>
       </div>
-    `;
+      <div class="product-card-divider"></div>
+      <div class="product-pipeline-bar">
+        ${stepsHtml}
+      </div>
+      <div id="pcard-action-${p.id}"></div>
+    </div>
+  `;
+}
+
+// --- Inline Card Actions ---
+
+function cardActionClose(productId) {
+  const area = document.getElementById(`pcard-action-${productId}`);
+  if (area) area.innerHTML = '';
+}
+
+function cardActionArea(productId, html) {
+  const area = document.getElementById(`pcard-action-${productId}`);
+  if (area) area.innerHTML = `
+    <div class="product-card-action">
+      <button class="action-close" onclick="cardActionClose(${productId})">&times;</button>
+      ${html}
+    </div>
+  `;
+}
+
+async function refreshCard(productId) {
+  try {
+    const p = await api(`/products/${productId}`);
+    // Update local cache
+    const idx = products.findIndex(x => x.id === productId);
+    if (idx >= 0) products[idx] = p;
+    // Re-render card in place
+    const cardEl = document.getElementById(`pcard-${productId}`);
+    if (cardEl) {
+      const newHtml = renderProductCard(p);
+      cardEl.outerHTML = newHtml;
+    }
   } catch (err) {
-    el.innerHTML = `<div class="empty-state"><h3>Erro</h3><p>${err.message}</p></div>`;
+    console.error('refreshCard error:', err);
   }
 }
 
-// --- Product Detail ---
-async function renderProductDetail(el, productId) {
-  el.innerHTML = '<div class="view"><div class="spinner"></div></div>';
-
-  try {
-    const product = await api(`/products/${productId}`);
-
-    el.innerHTML = `
-      <div class="view">
-        <div class="page-header">
-          <div>
-            <div class="flex items-center gap-3">
-              <button class="btn btn-ghost btn-sm" onclick="navigate('products')">&larr; Voltar</button>
-              <h1><span class="mono" style="color:var(--accent)">${product.oem}</span></h1>
-            </div>
-            <p>${product.part_name || 'Produto não enriquecido'} ${product.brand ? '· ' + product.brand : ''}</p>
-          </div>
-        </div>
-
-        <!-- Pipeline -->
-        <div class="section">
-          <div id="product-pipeline"></div>
-        </div>
-
-        <!-- Actions -->
-        <div class="section">
-          <h2 class="section-header">Ações Rápidas</h2>
-          <div class="action-bar">
-            <button class="btn btn-primary" onclick="actionAIEnrich(${productId})" id="btn-ai-enrich">Enriquecer com IA</button>
-            <button class="btn btn-secondary" onclick="showPricingForm(${productId})">Calcular Preço</button>
-            <button class="btn btn-secondary" onclick="showImageUpload(${productId})">Upload Imagens</button>
-            <button class="btn btn-secondary" onclick="processBackground(${productId})" id="btn-process-bg">Tratar Fundo</button>
-            <button class="btn btn-secondary" onclick="actionGenerate(${productId})">Gerar Anúncio</button>
-            <button class="btn btn-secondary" onclick="actionValidate(${productId})">Validar</button>
-            <button class="btn btn-primary" onclick="actionPublish(${productId})">Publicar no ML</button>
-          </div>
-        </div>
-
-        <!-- Info -->
-        <div class="section">
-          <div class="card">
-            <h2 class="section-header">Dados do Produto</h2>
-            <div class="detail-grid">
-              <div class="detail-field">
-                <span class="detail-label">Nome da Peça</span>
-                <span class="detail-value">${product.part_name || '—'}</span>
-              </div>
-              <div class="detail-field">
-                <span class="detail-label">Marca</span>
-                <span class="detail-value">${product.brand || '—'}</span>
-              </div>
-              <div class="detail-field">
-                <span class="detail-label">Categoria</span>
-                <span class="detail-value">${product.category || '—'}</span>
-              </div>
-              <div class="detail-field">
-                <span class="detail-label">Confiança</span>
-                <span class="detail-value">${product.confidence_level != null ? product.confidence_level + '%' : '—'}</span>
-              </div>
-              <div class="detail-field">
-                <span class="detail-label">Fonte</span>
-                <span class="detail-value">${product.source_data === 'kb+ai' ? '<span class="badge badge-success">KB + IA</span>' : product.source_data === 'ai_only' ? '<span class="badge badge-info">IA</span>' : product.source_data === 'mock_provider' ? '<span class="badge badge-neutral">Mock</span>' : '—'}</span>
-              </div>
-              <div class="detail-field" style="grid-column:1/-1">
-                <span class="detail-label">Descrição Técnica</span>
-                <span class="detail-value">${product.technical_description || '—'}</span>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Compatibilities -->
-        ${product.compatibilities.length > 0 ? `
-        <div class="section">
-          <div class="card">
-            <h2 class="section-header">Compatibilidades</h2>
-            <div class="table-wrap" style="border:none">
-              <table>
-                <thead><tr><th>Marca</th><th>Modelo</th><th>Anos</th><th>Notas</th></tr></thead>
-                <tbody>
-                  ${product.compatibilities.map(c => `
-                    <tr style="cursor:default">
-                      <td>${c.motorcycle_brand}</td>
-                      <td>${c.motorcycle_model}</td>
-                      <td>${c.year_start}–${c.year_end}</td>
-                      <td>${c.notes || '—'}</td>
-                    </tr>
-                  `).join('')}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>` : ''}
-
-        <!-- Attributes -->
-        ${product.attributes.length > 0 ? `
-        <div class="section">
-          <div class="card">
-            <h2 class="section-header">Atributos</h2>
-            <div class="detail-grid">
-              ${product.attributes.map(a => `
-                <div class="detail-field">
-                  <span class="detail-label">${a.name}</span>
-                  <span class="detail-value">${a.value}</span>
-                </div>
-              `).join('')}
-            </div>
-          </div>
-        </div>` : ''}
-
-        <!-- Action Results Area -->
-        <div id="action-area"></div>
-      </div>
-    `;
-  } catch (err) {
-    el.innerHTML = `<div class="empty-state"><h3>Erro</h3><p>${err.message}</p></div>`;
+function cardAction(productId, stepId) {
+  switch (stepId) {
+    case 0: cardActionEnrich(productId); break;
+    case 1: cardActionPricing(productId); break;
+    case 2: cardActionImageUpload(productId); break;
+    case 3: cardActionBackground(productId); break;
+    case 4: cardActionGenerate(productId); break;
+    case 5: cardActionValidate(productId); break;
+    case 6: cardActionPublish(productId); break;
   }
 }
 
-// --- Product Actions ---
-async function actionAIEnrich(id) {
-  const btn = document.getElementById('btn-ai-enrich');
-  if (btn) { btn.disabled = true; btn.textContent = 'Enriquecendo...'; }
-
+// Step 0 — Enriquecer com IA
+async function cardActionEnrich(productId) {
+  cardActionArea(productId, `
+    <div class="flex items-center gap-2"><div class="spinner"></div> <span>Enriquecendo com IA...</span></div>
+  `);
   try {
-    const result = await api(`/products/${id}/ai-enrich`, { method: 'POST' });
-    toast(`${result.provider} [${result.model}]: ${result.common_name} (${result.confidence}% confiança)`, 'success');
-    navigate('product-detail', id);
+    const result = await api(`/products/${productId}/ai-enrich`, { method: 'POST' });
+    cardActionArea(productId, `
+      <div class="action-result success">
+        <strong>${result.common_name}</strong> — ${result.provider} [${result.model}]<br>
+        Confiança: ${result.confidence}%
+      </div>
+    `);
+    toast(`Enriquecido: ${result.common_name} (${result.confidence}%)`, 'success');
+    await refreshCard(productId);
   } catch (err) {
+    cardActionArea(productId, `<div class="action-result error">${escapeHtml(err.message)}</div>`);
     toast(err.message, 'error');
-    if (btn) { btn.disabled = false; btn.textContent = 'Enriquecer com IA'; }
   }
 }
 
-async function actionEnrich(id) {
-  try {
-    await api(`/products/${id}/mock-enrich`, { method: 'POST' });
-    toast('Produto enriquecido com sucesso', 'success');
-    navigate('product-detail', id);
-  } catch (err) { toast(err.message, 'error'); }
-}
-
-async function actionGenerate(id) {
-  try {
-    const listing = await api(`/products/${id}/listing/generate`, { method: 'POST' });
-    toast(`Anúncio gerado — Categoria: ${listing.ml_category || 'não definida'}`, 'success');
-    navigate('product-detail', id);
-  } catch (err) { toast(err.message, 'error'); }
-}
-
-async function actionValidate(id) {
-  try {
-    const result = await api(`/products/${id}/listing/validate`, { method: 'POST' });
-    if (result.valid) {
-      toast('Anúncio validado — pronto para publicar', 'success');
-    } else {
-      toast(`Validação falhou: ${result.errors.join(', ')}`, 'error');
-    }
-  } catch (err) { toast(err.message, 'error'); }
-}
-
-async function actionPublish(id) {
-  try {
-    const result = await api(`/products/${id}/listing/publish`, { method: 'POST' });
-    toast(`Publicado no ML! ID: ${result.ml_item_id}`, 'success');
-    if (result.permalink) {
-      const area = document.getElementById('action-area');
-      area.innerHTML = `
-        <div class="card" style="border-color:var(--success)">
-          <h2 class="section-header">Publicado com Sucesso</h2>
-          <p>ML Item ID: <span class="mono">${result.ml_item_id}</span></p>
-          ${result.permalink ? `<a href="${result.permalink}" target="_blank" class="btn btn-primary mt-4">Ver no Mercado Livre &rarr;</a>` : ''}
-        </div>
-      `;
-    }
-  } catch (err) { toast(err.message, 'error'); }
-}
-
-async function showPricingForm(id) {
-  const area = document.getElementById('action-area');
-  area.innerHTML = `<div class="card section"><p>Carregando dados de preço...</p></div>`;
+// Step 1 — Preço
+async function cardActionPricing(productId) {
+  cardActionArea(productId, `<div class="flex items-center gap-2"><div class="spinner"></div> Carregando...</div>`);
 
   let info = { cost: 0, estimated_shipping: 0, commission_percent: 0.16, fixed_fee: 0, margin_percent: 0.20, honda_price: null };
-  try {
-    info = await api(`/products/${id}/pricing/info`);
-  } catch (e) { /* usa defaults */ }
+  try { info = await api(`/products/${productId}/pricing/info`); } catch { /* defaults */ }
 
   const costValue = info.honda_price || info.cost || 0;
   const hondaBadge = info.honda_price
-    ? `<div style="background:var(--info-subtle);padding:var(--space-3);border-radius:var(--radius-md);margin-bottom:var(--space-4)">
-        <strong>Preço Honda (catálogo):</strong> R$ ${parseFloat(info.honda_price).toFixed(2)}
-        <span style="color:var(--text-tertiary);margin-left:8px">— preenchido automaticamente no custo</span>
-      </div>`
-    : '';
-
+    ? `<div style="background:var(--info-subtle);padding:var(--space-3);border-radius:var(--radius-sm);margin-bottom:var(--space-3);font-size:12px">
+        <strong>Preço Honda:</strong> R$ ${parseFloat(info.honda_price).toFixed(2)}
+      </div>` : '';
   const existingPrice = info.suggested_price
-    ? `<div style="background:var(--success-subtle);padding:var(--space-3);border-radius:var(--radius-md);margin-bottom:var(--space-4)">
+    ? `<div style="background:var(--success-subtle);padding:var(--space-3);border-radius:var(--radius-sm);margin-bottom:var(--space-3);font-size:12px">
         <strong>Preço atual:</strong> R$ ${parseFloat(info.suggested_price).toFixed(2)}
-        ${info.final_price ? ` | <strong>Final:</strong> R$ ${parseFloat(info.final_price).toFixed(2)}` : ''}
-      </div>`
-    : '';
+        ${info.final_price ? ` | Final: R$ ${parseFloat(info.final_price).toFixed(2)}` : ''}
+      </div>` : '';
 
-  area.innerHTML = `
-    <div class="card section">
-      <h2 class="section-header">Calcular Preço</h2>
-      ${hondaBadge}${existingPrice}
-      <div class="detail-grid">
-        <div class="form-group">
-          <label class="form-label">Custo (R$)</label>
-          <input type="number" step="0.01" id="price-cost" class="form-input" placeholder="0.00" value="${costValue}">
-        </div>
-        <div class="form-group">
-          <label class="form-label">Frete Estimado (R$)</label>
-          <input type="number" step="0.01" id="price-shipping" class="form-input" placeholder="0.00" value="${info.estimated_shipping}">
-        </div>
-        <div class="form-group">
-          <label class="form-label">Comissão ML (%)</label>
-          <input type="number" step="0.01" id="price-commission" class="form-input" placeholder="0.16" value="${info.commission_percent}">
-        </div>
-        <div class="form-group">
-          <label class="form-label">Taxa Fixa (R$)</label>
-          <input type="number" step="0.01" id="price-fee" class="form-input" placeholder="0.00" value="${info.fixed_fee}">
-        </div>
-        <div class="form-group">
-          <label class="form-label">Margem (%)</label>
-          <input type="number" step="0.01" id="price-margin" class="form-input" placeholder="0.20" value="${info.margin_percent}">
-        </div>
+  cardActionArea(productId, `
+    <h3 style="margin-bottom:var(--space-3)">Calcular Preço</h3>
+    ${hondaBadge}${existingPrice}
+    <div class="form-row">
+      <div class="form-group">
+        <label class="form-label">Custo (R$)</label>
+        <input type="number" step="0.01" id="pc-cost-${productId}" class="form-input" value="${costValue}">
       </div>
-      <div class="mt-4">
-        <button class="btn btn-primary" onclick="submitPricing(${id})">Calcular</button>
+      <div class="form-group">
+        <label class="form-label">Frete (R$)</label>
+        <input type="number" step="0.01" id="pc-ship-${productId}" class="form-input" value="${info.estimated_shipping}">
       </div>
-      <div id="pricing-result" class="mt-4"></div>
+      <div class="form-group">
+        <label class="form-label">Comissão ML (%)</label>
+        <input type="number" step="0.01" id="pc-comm-${productId}" class="form-input" value="${info.commission_percent}">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Taxa Fixa (R$)</label>
+        <input type="number" step="0.01" id="pc-fee-${productId}" class="form-input" value="${info.fixed_fee}">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Margem (%)</label>
+        <input type="number" step="0.01" id="pc-margin-${productId}" class="form-input" value="${info.margin_percent}">
+      </div>
     </div>
-  `;
+    <div style="margin-top:var(--space-3)">
+      <button class="btn btn-primary btn-sm" onclick="submitCardPricing(${productId})">Calcular</button>
+    </div>
+    <div id="pc-result-${productId}"></div>
+  `);
 }
 
-async function submitPricing(id) {
+async function submitCardPricing(productId) {
   const body = {
-    cost: parseFloat(document.getElementById('price-cost').value),
-    estimated_shipping: parseFloat(document.getElementById('price-shipping').value),
-    commission_percent: parseFloat(document.getElementById('price-commission').value),
-    fixed_fee: parseFloat(document.getElementById('price-fee').value),
-    margin_percent: parseFloat(document.getElementById('price-margin').value),
+    cost: parseFloat(document.getElementById(`pc-cost-${productId}`).value),
+    estimated_shipping: parseFloat(document.getElementById(`pc-ship-${productId}`).value),
+    commission_percent: parseFloat(document.getElementById(`pc-comm-${productId}`).value),
+    fixed_fee: parseFloat(document.getElementById(`pc-fee-${productId}`).value),
+    margin_percent: parseFloat(document.getElementById(`pc-margin-${productId}`).value),
   };
+  const resultEl = document.getElementById(`pc-result-${productId}`);
+  resultEl.innerHTML = '<div class="flex items-center gap-2" style="margin-top:var(--space-3)"><div class="spinner"></div> Calculando...</div>';
   try {
-    const result = await apiPost(`/products/${id}/pricing/calculate`, body);
-    document.getElementById('pricing-result').innerHTML = `
-      <div style="background:var(--success-subtle);padding:var(--space-4);border-radius:var(--radius-md)">
-        <strong style="font-size:20px">R$ ${parseFloat(result.suggested_price).toFixed(2)}</strong>
-        <span style="color:var(--text-tertiary);margin-left:8px">preço sugerido</span>
-      </div>
-    `;
-    toast('Preço calculado com sucesso', 'success');
-  } catch (err) { toast(err.message, 'error'); }
+    const result = await apiPost(`/products/${productId}/pricing/calculate`, body);
+    toast(`Preço calculado: R$ ${parseFloat(result.suggested_price).toFixed(2)}`, 'success');
+    // Refresh card to advance pipeline — the toast shows the result
+    await refreshCard(productId);
+  } catch (err) {
+    resultEl.innerHTML = `<div class="action-result error" style="margin-top:var(--space-3)">${escapeHtml(err.message)}</div>`;
+    toast(err.message, 'error');
+  }
 }
 
-function showImageUpload(id) {
-  const area = document.getElementById('action-area');
-  area.innerHTML = `
-    <div class="card section">
-      <h2 class="section-header">Upload de Imagens</h2>
-      <div class="upload-zone" id="img-zone" onclick="document.getElementById('img-input').click()">
-        <div class="upload-icon">&#128247;</div>
-        <p><strong>Selecione várias imagens</strong> do produto</p>
-        <p style="font-size:11px;margin-top:4px">JPG, PNG — max 10MB cada — até 10 imagens por vez</p>
+// --- Image preview helper ---
+function renderExistingImages(product, type) {
+  const imgs = (product.images || []).filter(i => i.image_type === type);
+  if (!imgs.length) return '';
+  return `
+    <div style="margin-bottom:var(--space-3)">
+      <span style="font-size:12px;color:var(--text-secondary)"><strong>${imgs.length}</strong> imagem(ns) ${type === 'processed' ? 'processada(s)' : 'original(is)'}</span>
+      <div class="image-grid" style="margin-top:var(--space-2)">
+        ${imgs.map(img => `
+          <div class="image-thumb">
+            <img src="/uploads/${encodeURIComponent(product.oem)}/${encodeURIComponent(img.filename)}" alt="${escapeHtml(img.filename)}">
+          </div>
+        `).join('')}
       </div>
-      <input type="file" id="img-input" accept="image/*" multiple style="display:none" onchange="previewImages(${id}, this)">
-      <div id="img-preview" class="mt-4"></div>
-      <div id="img-result" class="mt-4"></div>
     </div>
   `;
+}
 
-  // Drag & drop
-  const zone = document.getElementById('img-zone');
+function getLocalProduct(productId) {
+  return products.find(p => p.id === productId);
+}
+
+// Step 2 — Upload de Imagens
+function cardActionImageUpload(productId) {
+  const product = getLocalProduct(productId);
+  const existingHtml = product ? renderExistingImages(product, 'original') : '';
+
+  cardActionArea(productId, `
+    <h3 style="margin-bottom:var(--space-3)">Upload de Imagens</h3>
+    ${existingHtml}
+    <div class="upload-zone" id="img-zone-${productId}" onclick="document.getElementById('img-input-${productId}').click()" style="padding:var(--space-6)">
+      <div class="upload-icon">&#128247;</div>
+      <p><strong>Selecione imagens</strong> do produto</p>
+      <p style="font-size:11px;margin-top:4px">JPG, PNG — max 10MB — até 10 imagens</p>
+    </div>
+    <input type="file" id="img-input-${productId}" accept="image/*" multiple style="display:none" onchange="previewCardImages(${productId}, this)">
+    <div id="img-preview-${productId}" style="margin-top:var(--space-3)"></div>
+    <div id="img-result-${productId}"></div>
+  `);
+
+  const zone = document.getElementById(`img-zone-${productId}`);
   zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('dragover'); });
   zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
   zone.addEventListener('drop', e => {
     e.preventDefault();
     zone.classList.remove('dragover');
     if (e.dataTransfer.files.length) {
-      document.getElementById('img-input').files = e.dataTransfer.files;
-      previewImages(id, document.getElementById('img-input'));
+      document.getElementById(`img-input-${productId}`).files = e.dataTransfer.files;
+      previewCardImages(productId, document.getElementById(`img-input-${productId}`));
     }
   });
 }
 
-function previewImages(id, input) {
+function previewCardImages(productId, input) {
   const files = input.files;
   if (!files.length) return;
-
-  const preview = document.getElementById('img-preview');
+  const preview = document.getElementById(`img-preview-${productId}`);
   preview.innerHTML = `
-    <div style="margin-bottom:var(--space-3);color:var(--text-secondary);font-size:13px">
-      <strong>${files.length} imagem(ns)</strong> selecionada(s)
-    </div>
+    <div style="font-size:12px;color:var(--text-secondary);margin-bottom:var(--space-2)"><strong>${files.length}</strong> imagem(ns)</div>
     <div class="image-grid">
-      ${Array.from(files).map((f, i) => `
-        <div class="image-thumb" id="thumb-${i}">
-          <span>${f.name.substring(0, 12)}...</span>
-        </div>
-      `).join('')}
+      ${Array.from(files).map((f, i) => `<div class="image-thumb" id="cthumb-${productId}-${i}"><span style="font-size:10px">${f.name.substring(0, 10)}</span></div>`).join('')}
     </div>
-    <button class="btn btn-primary mt-4" onclick="submitImages(${id})">Enviar ${files.length} imagem(ns)</button>
+    <button class="btn btn-primary btn-sm" style="margin-top:var(--space-3)" onclick="submitCardImages(${productId})">Enviar ${files.length} imagem(ns)</button>
   `;
-
-  // Render thumbnails
   Array.from(files).forEach((f, i) => {
     const reader = new FileReader();
     reader.onload = e => {
-      const thumb = document.getElementById(`thumb-${i}`);
-      if (thumb) thumb.innerHTML = `<img src="${e.target.result}" alt="${f.name}">`;
+      const t = document.getElementById(`cthumb-${productId}-${i}`);
+      if (t) t.innerHTML = `<img src="${e.target.result}">`;
     };
     reader.readAsDataURL(f);
   });
 }
 
-async function submitImages(id) {
-  const input = document.getElementById('img-input');
+async function submitCardImages(productId) {
+  const input = document.getElementById(`img-input-${productId}`);
   const files = input.files;
   if (!files.length) return;
 
-  document.getElementById('img-result').innerHTML = '<div class="flex items-center gap-2"><div class="spinner"></div> Enviando ' + files.length + ' imagem(ns)...</div>';
+  const resultEl = document.getElementById(`img-result-${productId}`);
+  resultEl.innerHTML = '<div class="flex items-center gap-2" style="margin-top:var(--space-3)"><div class="spinner"></div> Enviando...</div>';
 
   const form = new FormData();
   for (const f of files) form.append('files', f);
 
   try {
-    const result = await api(`/products/${id}/images/upload`, { method: 'POST', body: form, headers: {} });
-    document.getElementById('img-preview').innerHTML = '';
-    document.getElementById('img-result').innerHTML = `
-      <div style="background:var(--success-subtle);padding:var(--space-4);border-radius:var(--radius-md)">
-        <strong>${result.files.length} imagem(ns) salva(s) com sucesso</strong>
-      </div>
-    `;
+    const result = await api(`/products/${productId}/images/upload`, { method: 'POST', body: form, headers: {} });
+    resultEl.innerHTML = `<div class="action-result success" style="margin-top:var(--space-3)"><strong>${result.files.length} imagem(ns) salva(s)</strong></div>`;
     toast(`${result.files.length} imagens enviadas`, 'success');
+    await refreshCard(productId);
   } catch (err) {
-    document.getElementById('img-result').innerHTML = `<div style="color:var(--error)">${err.message}</div>`;
+    resultEl.innerHTML = `<div class="action-result error" style="margin-top:var(--space-3)">${escapeHtml(err.message)}</div>`;
     toast(err.message, 'error');
   }
 }
 
-async function processBackground(id) {
-  const btn = document.getElementById('btn-process-bg');
-  const oldText = btn.textContent;
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spinner" style="width:14px;height:14px"></span> Processando...';
+// Step 3 — Tratar Fundo
+async function cardActionBackground(productId) {
+  const product = getLocalProduct(productId);
+  const processedHtml = product ? renderExistingImages(product, 'processed') : '';
+  const originalHtml = product ? renderExistingImages(product, 'original') : '';
+  const hasProcessed = product && (product.images || []).some(i => i.image_type === 'processed');
 
-  const area = document.getElementById('action-area');
-  area.innerHTML = `
-    <div class="card section">
-      <h2 class="section-header">Tratamento de Fundo</h2>
-      <div class="flex items-center gap-2">
-        <div class="spinner"></div>
-        <span>Removendo fundo e aplicando fundo branco nas imagens... Isso pode levar alguns segundos.</span>
-      </div>
-    </div>
-  `;
+  cardActionArea(productId, `
+    <h3 style="margin-bottom:var(--space-3)">Tratamento de Fundo</h3>
+    ${processedHtml || originalHtml}
+    <button class="btn btn-primary btn-sm" id="btn-bg-${productId}" onclick="execBackground(${productId})">
+      ${hasProcessed ? 'Reprocessar Fundo' : 'Remover Fundo'}
+    </button>
+    <div id="bg-result-${productId}" style="margin-top:var(--space-3)"></div>
+  `);
+}
+
+async function execBackground(productId) {
+  const btn = document.getElementById(`btn-bg-${productId}`);
+  const resultEl = document.getElementById(`bg-result-${productId}`);
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner" style="width:14px;height:14px;display:inline-block;vertical-align:middle"></span> Processando...'; }
+  resultEl.innerHTML = '';
 
   try {
-    const result = await api(`/products/${id}/images/process-background`, { method: 'POST' });
-    area.innerHTML = `
-      <div class="card section">
-        <h2 class="section-header">Tratamento de Fundo</h2>
-        <div style="background:var(--success-subtle);padding:var(--space-4);border-radius:var(--radius-md)">
-          <strong>${result.message}</strong>
-          ${result.errors.length ? `<div style="color:var(--error);margin-top:8px">Erros: ${result.errors.map(e => e.file).join(', ')}</div>` : ''}
-        </div>
-        <div style="margin-top:var(--space-4);font-size:13px;color:var(--text-secondary)">
-          As imagens processadas serao usadas automaticamente na publicacao do anuncio.
-        </div>
+    const result = await api(`/products/${productId}/images/process-background`, { method: 'POST' });
+    resultEl.innerHTML = `
+      <div class="action-result success">
+        <strong>${result.message}</strong>
+        ${result.errors && result.errors.length ? `<div style="color:var(--error);margin-top:4px">Erros: ${result.errors.map(e => e.file).join(', ')}</div>` : ''}
       </div>
     `;
     toast(result.message, 'success');
+    await refreshCard(productId);
+    // Re-open fundo panel to show new processed images
+    cardActionBackground(productId);
   } catch (err) {
-    area.innerHTML = `
-      <div class="card section">
-        <h2 class="section-header">Tratamento de Fundo</h2>
-        <div style="color:var(--error)">${err.message}</div>
-      </div>
-    `;
+    resultEl.innerHTML = `<div class="action-result error">${escapeHtml(err.message)}</div>`;
     toast(err.message, 'error');
-  } finally {
-    btn.disabled = false;
-    btn.textContent = oldText;
+    if (btn) { btn.disabled = false; btn.textContent = 'Remover Fundo'; }
   }
 }
+
+// Step 4 — Gerar Anúncio
+async function cardActionGenerate(productId) {
+  cardActionArea(productId, `
+    <div class="flex items-center gap-2"><div class="spinner"></div> <span>Gerando anúncio...</span></div>
+  `);
+  try {
+    const listing = await api(`/products/${productId}/listing/generate`, { method: 'POST' });
+    cardActionArea(productId, `
+      <div class="action-result success">
+        <strong>Anúncio gerado</strong> — Categoria: ${listing.ml_category || 'não definida'}
+      </div>
+    `);
+    toast('Anúncio gerado', 'success');
+    await refreshCard(productId);
+  } catch (err) {
+    cardActionArea(productId, `<div class="action-result error">${escapeHtml(err.message)}</div>`);
+    toast(err.message, 'error');
+  }
+}
+
+// Step 5 — Validar
+async function cardActionValidate(productId) {
+  cardActionArea(productId, `
+    <div class="flex items-center gap-2"><div class="spinner"></div> <span>Validando anúncio...</span></div>
+  `);
+  try {
+    const result = await api(`/products/${productId}/listing/validate`, { method: 'POST' });
+    if (result.valid) {
+      cardActionArea(productId, `<div class="action-result success"><strong>Anúncio validado</strong> — pronto para publicar</div>`);
+      toast('Validado com sucesso', 'success');
+    } else {
+      cardActionArea(productId, `<div class="action-result error"><strong>Falha na validação:</strong> ${result.errors.join(', ')}</div>`);
+      toast('Validação falhou', 'error');
+    }
+    await refreshCard(productId);
+  } catch (err) {
+    cardActionArea(productId, `<div class="action-result error">${escapeHtml(err.message)}</div>`);
+    toast(err.message, 'error');
+  }
+}
+
+// Step 6 — Publicar no ML
+async function cardActionPublish(productId) {
+  cardActionArea(productId, `
+    <div class="flex items-center gap-2"><div class="spinner"></div> <span>Publicando no Mercado Livre...</span></div>
+  `);
+  try {
+    const result = await api(`/products/${productId}/listing/publish`, { method: 'POST' });
+    toast(`Publicado! ID: ${result.ml_item_id}`, 'success');
+
+    // Refresh card first to update pipeline to "published"
+    await refreshCard(productId);
+
+    // Then show the result with the permalink inside the refreshed card
+    cardActionArea(productId, `
+      <div class="action-result success">
+        <strong>Publicado!</strong> ML ID: <span class="mono">${result.ml_item_id}</span>
+        ${result.permalink ? `<div style="margin-top:var(--space-2)"><a href="${result.permalink}" target="_blank" class="btn btn-primary btn-sm">Ver no Mercado Livre &rarr;</a></div>` : ''}
+      </div>
+    `);
+  } catch (err) {
+    cardActionArea(productId, `<div class="action-result error">${escapeHtml(err.message)}</div>`);
+    toast(err.message, 'error');
+  }
+}
+
+// --- Products List ---
+let productsFilter = 'all';
+
+function filterProducts(filter) {
+  productsFilter = filter;
+  applyProductsFilter();
+}
+
+function applyProductsFilter() {
+  // Update active button
+  document.querySelectorAll('.filter-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.filter === productsFilter);
+  });
+
+  const filtered = productsFilter === 'all'
+    ? products
+    : productsFilter === 'published'
+      ? products.filter(p => statusToProgress(p) >= 7)
+      : products.filter(p => statusToProgress(p) < 7);
+
+  const listEl = document.getElementById('products-list');
+  const countEl = document.getElementById('products-count');
+
+  if (!listEl) return;
+
+  countEl.textContent = `${filtered.length} de ${products.length} produto${products.length !== 1 ? 's' : ''}`;
+
+  if (filtered.length > 0) {
+    listEl.innerHTML = filtered.map(p => renderProductCard(p)).join('');
+  } else {
+    const msg = productsFilter === 'published'
+      ? 'Nenhum produto publicado ainda'
+      : productsFilter === 'in_progress'
+        ? 'Nenhum produto em andamento'
+        : 'Nenhum produto';
+    listEl.innerHTML = `<div class="empty-state"><h3>${msg}</h3></div>`;
+  }
+}
+
+async function renderProducts(el) {
+  el.innerHTML = '<div class="view"><div class="spinner"></div></div>';
+
+  try {
+    products = await api('/products');
+
+    const publishedCount = products.filter(p => statusToProgress(p) >= 7).length;
+    const inProgressCount = products.length - publishedCount;
+
+    el.innerHTML = `
+      <div class="view">
+        <div class="page-header">
+          <div>
+            <h1>Produtos</h1>
+            <p id="products-count">${products.length} produto${products.length !== 1 ? 's' : ''} no sistema</p>
+          </div>
+          <button class="btn btn-secondary" onclick="navigate('import')">Importar OEMs</button>
+        </div>
+
+        <div class="products-filter-bar">
+          <button class="filter-btn ${productsFilter === 'all' ? 'active' : ''}" data-filter="all" onclick="filterProducts('all')">
+            Todos <span class="filter-count">${products.length}</span>
+          </button>
+          <button class="filter-btn ${productsFilter === 'in_progress' ? 'active' : ''}" data-filter="in_progress" onclick="filterProducts('in_progress')">
+            Em andamento <span class="filter-count">${inProgressCount}</span>
+          </button>
+          <button class="filter-btn ${productsFilter === 'published' ? 'active' : ''}" data-filter="published" onclick="filterProducts('published')">
+            Publicados <span class="filter-count">${publishedCount}</span>
+          </button>
+        </div>
+
+        <div class="product-cards-list" id="products-list"></div>
+      </div>
+    `;
+
+    applyProductsFilter();
+
+  } catch (err) {
+    el.innerHTML = `<div class="empty-state"><h3>Erro</h3><p>${escapeHtml(err.message)}</p></div>`;
+  }
+}
+
+// --- Product Detail ---
 
 // --- Knowledge Base ---
 async function renderKnowledgeBase(el) {
@@ -738,7 +873,7 @@ async function renderKnowledgeBase(el) {
               <div class="card provider-card" id="provider-card-${p.id}">
                 <div class="flex items-center gap-3" style="margin-bottom:var(--space-4)">
                   <span class="status-dot ${p.configured ? 'connected' : 'disconnected'}"></span>
-                  <span style="font-weight:600;font-size:14px">${p.name}</span>
+                  <span style="font-weight:600;font-size:14px">${escapeHtml(p.name)}</span>
                 </div>
                 ${p.configured ? `
                   <div style="margin-bottom:var(--space-3)">
@@ -831,8 +966,8 @@ async function renderKnowledgeBase(el) {
                 ${docs.map(d => `
                   <tr style="cursor:default">
                     <td class="mono">#${d.id}</td>
-                    <td>${d.filename}</td>
-                    <td>${d.brand}</td>
+                    <td>${escapeHtml(d.filename)}</td>
+                    <td>${escapeHtml(d.brand)}</td>
                     <td>${d.page_count || '—'}</td>
                     <td>${d.entry_count}</td>
                     <td>${kbStatusBadge(d.status)}</td>
@@ -864,7 +999,7 @@ async function renderKnowledgeBase(el) {
     searchInput.addEventListener('keydown', e => { if (e.key === 'Enter') searchKB(); });
 
   } catch (err) {
-    el.innerHTML = `<div class="empty-state"><h3>Erro</h3><p>${err.message}</p></div>`;
+    el.innerHTML = `<div class="empty-state"><h3>Erro</h3><p>${escapeHtml(err.message)}</p></div>`;
   }
 }
 
@@ -892,7 +1027,7 @@ async function handleKBUpload(input) {
     const data = await api('/kb/upload', { method: 'POST', body: form, headers: {} });
     result.innerHTML = `
       <div class="card" style="background:var(--success-subtle);border-color:var(--success)">
-        <strong>${data.filename}</strong> enviado com sucesso<br>
+        <strong>${escapeHtml(data.filename)}</strong> enviado com sucesso<br>
         <span style="color:var(--text-secondary)">Status: ${data.status} — O processamento está sendo feito em background.</span>
         <div class="mt-4">
           <button class="btn btn-secondary btn-sm" onclick="navigate('kb')">Atualizar</button>
@@ -901,7 +1036,7 @@ async function handleKBUpload(input) {
     `;
     toast('Catálogo enviado! Processamento em background.', 'success');
   } catch (err) {
-    result.innerHTML = `<div class="card" style="border-color:var(--error);color:var(--error)">${err.message}</div>`;
+    result.innerHTML = `<div class="card" style="border-color:var(--error);color:var(--error)">${escapeHtml(err.message)}</div>`;
     toast(err.message, 'error');
   }
 }
@@ -919,17 +1054,17 @@ async function searchKB() {
     if (!result.found_in_kb) {
       resultEl.innerHTML = `
         <div class="card" style="border-color:var(--warning)">
-          <strong>OEM ${result.oem_code}</strong> não encontrado na base de conhecimento.
+          <strong>OEM ${escapeHtml(result.oem_code)}</strong> não encontrado na base de conhecimento.
           <p style="color:var(--text-tertiary);font-size:12px;margin-top:var(--space-2)">A IA ainda pode enriquecer este produto usando conhecimento geral.</p>
         </div>
       `;
     } else {
       resultEl.innerHTML = `
         <div class="card" style="border-color:var(--success)">
-          <strong>${result.entries.length} entrada(s)</strong> encontrada(s) para <span class="mono">${result.oem_code}</span>
+          <strong>${result.entries.length} entrada(s)</strong> encontrada(s) para <span class="mono">${escapeHtml(result.oem_code)}</span>
           ${result.entries.map(e => `
             <div style="margin-top:var(--space-3);padding:var(--space-3);background:var(--bg-elevated);border-radius:var(--radius-sm)">
-              <div><strong>Descrição Honda:</strong> ${e.honda_part_name || '—'}</div>
+              <div><strong>Descrição Honda:</strong> ${escapeHtml(e.honda_part_name) || '—'}</div>
               <div><strong>Preço Honda:</strong> ${e.honda_price ? 'R$ ' + parseFloat(e.honda_price).toFixed(2) : '—'}</div>
               <div><strong>Página:</strong> ${e.page_number || '—'}</div>
             </div>
@@ -938,7 +1073,7 @@ async function searchKB() {
       `;
     }
   } catch (err) {
-    resultEl.innerHTML = `<div style="color:var(--error)">${err.message}</div>`;
+    resultEl.innerHTML = `<div style="color:var(--error)">${escapeHtml(err.message)}</div>`;
   }
 }
 
@@ -960,7 +1095,7 @@ async function saveProvider(id) {
     toast(`${id} configurado com sucesso`, 'success');
     navigate('kb');
   } catch (err) {
-    resultEl.innerHTML = `<div style="color:var(--error)">${err.message}</div>`;
+    resultEl.innerHTML = `<div style="color:var(--error)">${escapeHtml(err.message)}</div>`;
     toast(err.message, 'error');
   }
 }
@@ -1032,7 +1167,7 @@ async function renderAuth(el) {
       </div>
     `;
   } catch (err) {
-    el.innerHTML = `<div class="empty-state"><h3>Erro</h3><p>${err.message}</p></div>`;
+    el.innerHTML = `<div class="empty-state"><h3>Erro</h3><p>${escapeHtml(err.message)}</p></div>`;
   }
 }
 
@@ -1086,7 +1221,7 @@ async function submitAuthCode() {
     updateAuthStatus();
     navigate('auth');
   } catch (err) {
-    result.innerHTML = `<div style="color:var(--error);font-size:13px;margin-top:var(--space-2)">${err.message}</div>`;
+    result.innerHTML = `<div style="color:var(--error);font-size:13px;margin-top:var(--space-2)">${escapeHtml(err.message)}</div>`;
     toast(err.message, 'error');
   }
 }
@@ -1207,7 +1342,7 @@ async function doLogin() {
     currentUser = result.user;
     initApp();
   } catch (err) {
-    document.getElementById('auth-error').innerHTML = `<div style="color:var(--error)">${err.message}</div>`;
+    document.getElementById('auth-error').innerHTML = `<div style="color:var(--error)">${escapeHtml(err.message)}</div>`;
   }
 }
 
@@ -1222,7 +1357,7 @@ async function doRegister() {
     currentUser = result.user;
     initApp();
   } catch (err) {
-    document.getElementById('auth-error').innerHTML = `<div style="color:var(--error)">${err.message}</div>`;
+    document.getElementById('auth-error').innerHTML = `<div style="color:var(--error)">${escapeHtml(err.message)}</div>`;
   }
 }
 

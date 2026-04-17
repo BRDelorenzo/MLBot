@@ -82,9 +82,11 @@ def test_validate_listing_complete(client, db):
     ))
     db.commit()
 
-    resp = client.post(f"/products/{pid}/listing/validate")
+    with patch("app.routers.listings.get_category_attributes") as mock_attrs:
+        mock_attrs.return_value = []  # categoria sem atributos obrigatórios
+        resp = client.post(f"/products/{pid}/listing/validate")
     data = resp.json()
-    assert data["valid"] is True
+    assert data["valid"] is True, f"errors: {data.get('errors')}"
     assert data["errors"] == []
 
 

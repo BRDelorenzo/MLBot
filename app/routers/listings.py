@@ -1,14 +1,25 @@
 import logging
+import re
+import secrets
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from app.database import get_db
-from app.models import ImportItem, ItemStatus, Listing, ListingStatus, Product, User
-from app.services.auth import get_current_user
+from app.database import SessionLocal, get_db
+from app.models import ImportItem, ItemStatus, Listing, ListingStatus, Product, PublishEvent, User, UserRole
+from app.services.auth import get_current_user, require_role
 from app.schemas import ListingOut, MLPublishResult, ValidationResponse
 from app.services.ai_enrichment import lookup_kb
-from app.services.mercadolivre import MLAPIError, get_category_attributes, get_valid_token, predict_category, publish_item, upload_image
+from app.services.mercadolivre import (
+    MLAPIError,
+    get_category_attributes,
+    get_valid_token,
+    predict_category,
+    publish_item,
+    search_item_by_seller_sku,
+    upload_image,
+)
+from app.models import MLCredential
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +144,7 @@ Importante:
 
 @router.post("/{product_id}/listing/generate", response_model=ListingOut)
 def generate_listing(product_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    product = db.query(Product).filter(Product.id == product_id).first()
+    product = db.query(Product).filter(Product.id == product_id, Product.user_id == user.id).first()
     if not product:
         raise HTTPException(status_code=404, detail="Produto não encontrado")
 
@@ -146,7 +157,7 @@ def generate_listing(product_id: int, db: Session = Depends(get_db), user: User 
 
     # Busca descrição Honda na base de conhecimento
     honda_description = None
-    kb_entries = lookup_kb(product.oem, db)
+    kb_entries = lookup_kb(product.oem, db, user_id=product.user_id)
     if kb_entries:
         honda_description = kb_entries[0].honda_part_name
 
@@ -215,7 +226,7 @@ def generate_listing(product_id: int, db: Session = Depends(get_db), user: User 
 
 @router.post("/{product_id}/listing/validate", response_model=ValidationResponse)
 def validate_listing(product_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    product = db.query(Product).filter(Product.id == product_id).first()
+    product = db.query(Product).filter(Product.id == product_id, Product.user_id == user.id).first()
     if not product:
         raise HTTPException(status_code=404, detail="Produto não encontrado")
 
@@ -232,19 +243,43 @@ def validate_listing(product_id: int, db: Session = Depends(get_db), user: User 
         errors.append("Nenhuma imagem enviada")
     if not product.listing or not product.listing.title:
         errors.append("Anúncio ainda não foi gerado")
+
+    # ml_category pode ter ficado vazio se o predict_category falhou no momento
+    # de gerar o listing. Tenta resolver agora — evita forçar re-clique em Gerar.
+    if product.listing and product.listing.title and not product.listing.ml_category:
+        try:
+            predicted = predict_category(product.listing.title)
+            product.listing.ml_category = predicted.get("category_id") or None
+            if product.listing.ml_category:
+                logger.info(
+                    "Categoria do ML resolvida durante validação para '%s': %s",
+                    product.listing.title, product.listing.ml_category,
+                )
+        except MLAPIError as exc:
+            logger.warning(
+                "predict_category falhou durante validação (title='%s'): %s",
+                product.listing.title, exc.detail,
+            )
+
     if product.listing and not product.listing.ml_category:
-        errors.append("Categoria do ML não definida (gere o listing novamente)")
+        errors.append(
+            "Não foi possível determinar a categoria do ML para este título. "
+            "Refine o nome da peça no enriquecimento ou gere o anúncio novamente."
+        )
     if not product.pricing or not product.pricing.final_price:
         errors.append("Preço ainda não foi calculado")
 
-    # Verifica atributos obrigatórios da categoria ML
+    # Verifica atributos obrigatórios da categoria ML.
+    # Fail-closed: se o ML não responde, a validação falha — caso contrário
+    # o publish descobre tarde demais que faltam atributos.
     if product.listing and product.listing.ml_category:
         try:
             missing = _check_missing_required_attrs(product)
             for attr_name in missing:
                 errors.append(f"Atributo obrigatório do ML faltando: \"{attr_name}\" — adicione via enriquecimento IA ou edite manualmente")
-        except MLAPIError:
-            pass  # não bloqueia validação se API falhar
+        except MLAPIError as exc:
+            logger.warning("Falha ao buscar atributos da categoria %s durante validação: %s", product.listing.ml_category, exc.detail)
+            errors.append("Não foi possível verificar atributos obrigatórios (ML indisponível). Tente novamente em instantes.")
 
     import_item = db.query(ImportItem).filter(ImportItem.id == product.import_item_id).first()
 
@@ -265,19 +300,152 @@ def validate_listing(product_id: int, db: Session = Depends(get_db), user: User 
     return {"valid": True, "errors": []}
 
 
+_REDACT_PATTERNS = [
+    re.compile(r"(?i)bearer\s+[A-Za-z0-9._\-]+"),
+    re.compile(r"(?i)access_token[\"'\s:=]+[A-Za-z0-9._\-]+"),
+    re.compile(r"(?i)refresh_token[\"'\s:=]+[A-Za-z0-9._\-]+"),
+    re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"),
+]
+
+
+def _redact(text: str) -> str:
+    for rx in _REDACT_PATTERNS:
+        text = rx.sub("[REDACTED]", text)
+    return text
+
+
+def _log_publish_event(listing_id: int, user_id: int, idempotency_key: str,
+                       phase: str, ml_item_id: str | None = None, detail: str | None = None):
+    """Escreve PublishEvent em sessão própria — nunca parte da transação principal.
+
+    Garante que o evento persiste mesmo se a transação do publish falhar no
+    commit. Usado para reconciliação manual.
+    """
+    db = SessionLocal()
+    try:
+        safe_detail = _redact(detail or "")[:4000]
+        db.add(PublishEvent(
+            listing_id=listing_id,
+            user_id=user_id,
+            idempotency_key=idempotency_key,
+            phase=phase,
+            ml_item_id=ml_item_id,
+            detail=safe_detail,
+        ))
+        db.commit()
+    except Exception:
+        logger.exception("Falha ao registrar PublishEvent")
+        db.rollback()
+    finally:
+        db.close()
+
+
+@router.get("/{product_id}/listing/required-attributes")
+def get_required_attributes(product_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Retorna atributos obrigatórios da categoria ML e quais estão faltando no produto.
+
+    Frontend usa para destacar campos antes do usuário tentar validar/publicar.
+    """
+    product = db.query(Product).filter(Product.id == product_id, Product.user_id == user.id).first()
+    if not product:
+        raise HTTPException(status_code=404, detail="Produto não encontrado")
+    if not product.listing or not product.listing.ml_category:
+        return {"category_id": None, "required": [], "missing": [], "available": False}
+
+    try:
+        category_attrs = get_category_attributes(product.listing.ml_category)
+    except MLAPIError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    product_attr_names = {a.name.lower() for a in product.attributes}
+    auto_filled = {"PART_NUMBER", "BRAND", "MODEL", "SELLER_SKU"}
+
+    required = []
+    missing = []
+    for cat_attr in category_attrs:
+        attr_id = cat_attr["id"]
+        tags = cat_attr.get("tags", {})
+        if tags.get("read_only") or attr_id in auto_filled:
+            continue
+        if not (tags.get("required") or tags.get("catalog_required")):
+            continue
+        attr_name = cat_attr.get("name", attr_id)
+        required.append({
+            "id": attr_id,
+            "name": attr_name,
+            "values": [v.get("name") for v in cat_attr.get("values", [])[:20]],
+        })
+        id_as_name = attr_id.lower().replace("_", " ")
+        if attr_name.lower() not in product_attr_names and id_as_name not in product_attr_names:
+            missing.append(attr_name)
+
+    return {
+        "category_id": product.listing.ml_category,
+        "required": required,
+        "missing": missing,
+        "available": True,
+    }
+
+
 @router.post("/{product_id}/listing/publish", response_model=MLPublishResult)
-def publish_listing(product_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    product = db.query(Product).filter(Product.id == product_id).first()
+def publish_listing(product_id: int, db: Session = Depends(get_db), user: User = Depends(require_role(UserRole.admin, UserRole.operator))):
+    product = db.query(Product).filter(Product.id == product_id, Product.user_id == user.id).first()
     if not product or not product.listing:
         raise HTTPException(status_code=404, detail="Anúncio não encontrado")
 
-    if product.listing.status not in (ListingStatus.valid, ListingStatus.publish_error):
+    listing = product.listing
+
+    if listing.status not in (ListingStatus.valid, ListingStatus.publish_error):
         raise HTTPException(status_code=400, detail="Anúncio precisa estar validado antes da publicação")
 
+    # Idempotência: se já publicou com sucesso, retorna o mesmo ml_item_id.
+    if listing.status == ListingStatus.published and listing.ml_item_id:
+        return MLPublishResult(
+            ml_item_id=listing.ml_item_id,
+            permalink=None,
+            status="already_published",
+        )
+
     try:
-        access_token = get_valid_token(db)
+        access_token = get_valid_token(db, user_id=user.id)
     except MLAPIError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    # Idempotency key nova por tentativa (mas só muda se não há uma em curso)
+    idempotency_key = listing.idempotency_key or secrets.token_hex(16)
+
+    # Detecção de duplicata: busca no ML por seller_sku (OEM) antes de publicar.
+    # Cobre o caso de retry após ML ter aceitado o item mas commit local ter falhado.
+    credential = db.query(MLCredential).filter(MLCredential.user_id == user.id).first()
+    seller_id = credential.ml_user_id if credential else None
+    if seller_id:
+        try:
+            duplicates = search_item_by_seller_sku(access_token, seller_id, product.oem)
+            if duplicates:
+                ml_item_id = duplicates[0]
+                listing.ml_item_id = ml_item_id
+                listing.status = ListingStatus.published
+                listing.idempotency_key = None
+                db.commit()
+                _log_publish_event(
+                    listing.id, user.id, idempotency_key,
+                    "duplicate_detected", ml_item_id=ml_item_id,
+                    detail=f"Item já existia no ML para seller_sku={product.oem}",
+                )
+                return MLPublishResult(
+                    ml_item_id=ml_item_id,
+                    permalink=None,
+                    status="already_published",
+                )
+        except Exception:
+            logger.exception("Falha ao checar duplicata por seller_sku — seguindo com publish")
+
+    # Marca início da tentativa — persiste ANTES do call ao ML
+    listing.status = ListingStatus.publishing
+    listing.idempotency_key = idempotency_key
+    listing.publish_attempts = (listing.publish_attempts or 0) + 1
+    db.commit()
+    _log_publish_event(listing.id, user.id, idempotency_key, "before_ml")
 
     # Upload de imagens — prioriza processadas (fundo branco), fallback para originais
     from app.models import ImageType
@@ -374,19 +542,45 @@ def publish_listing(product_id: int, db: Session = Depends(get_db), user: User =
     except MLAPIError as exc:
         product.listing.status = ListingStatus.publish_error
         db.commit()
+        _log_publish_event(
+            listing.id, user.id, idempotency_key, "ml_error",
+            detail=f"{exc.status_code}: {exc.detail}",
+        )
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
-    product.listing.ml_item_id = result["id"]
-    product.listing.status = ListingStatus.published
+    # ML aceitou. Registra evento ANTES de tentar commit local — assim se o commit
+    # falhar ainda temos rastro do ml_item_id para reconciliação.
+    ml_item_id = result["id"]
+    _log_publish_event(
+        listing.id, user.id, idempotency_key, "ml_success",
+        ml_item_id=ml_item_id, detail=result.get("permalink", ""),
+    )
 
-    import_item = db.query(ImportItem).filter(ImportItem.id == product.import_item_id).first()
-    if import_item:
-        import_item.status = ItemStatus.published
+    try:
+        product.listing.ml_item_id = ml_item_id
+        product.listing.status = ListingStatus.published
+        product.listing.idempotency_key = None
 
-    db.commit()
+        import_item = db.query(ImportItem).filter(ImportItem.id == product.import_item_id).first()
+        if import_item:
+            import_item.status = ItemStatus.published
+
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        _log_publish_event(
+            listing.id, user.id, idempotency_key, "db_error",
+            ml_item_id=ml_item_id,
+            detail=f"DB commit falhou pós-publish: {exc!r}",
+        )
+        logger.exception("ML aceitou item %s mas DB commit falhou — ver PublishEvent para reconciliação", ml_item_id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Anúncio criado no ML ({ml_item_id}) mas salvamento local falhou. Contate o suporte.",
+        ) from exc
 
     return MLPublishResult(
-        ml_item_id=result["id"],
+        ml_item_id=ml_item_id,
         permalink=result.get("permalink"),
         status="published",
     )

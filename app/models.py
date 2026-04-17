@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 from enum import StrEnum
 
-from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import relationship
 
@@ -205,10 +205,71 @@ class Listing(Base):
     quantity = Column(Integer, default=1, nullable=False)
     status = Column(SAEnum(ListingStatus), default=ListingStatus.draft, nullable=False)
     ml_item_id = Column(String(120), nullable=True)
+    idempotency_key = Column(String(64), nullable=True, index=True)
+    publish_attempts = Column(Integer, default=0, nullable=False)
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
     product = relationship("Product", back_populates="listing")
+
+
+class PublishEvent(Base):
+    """Log append-only de tentativas de publicação no ML.
+
+    Usado para reconciliação quando há divergência entre ML e DB (ex: ML
+    aceitou o item mas o commit local falhou).
+    """
+
+    __tablename__ = "publish_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    listing_id = Column(Integer, ForeignKey("listings.id"), index=True, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=True)
+    idempotency_key = Column(String(64), index=True, nullable=False)
+    phase = Column(String(40), nullable=False)  # "before_ml","ml_success","ml_error","db_error","duplicate_detected"
+    ml_item_id = Column(String(120), nullable=True)
+    detail = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=_utcnow)
+
+
+class ImageAccessToken(Base):
+    """Token one-shot, curta duração, para servir imagens sem expor o JWT na URL."""
+
+    __tablename__ = "image_access_tokens"
+
+    id = Column(Integer, primary_key=True, index=True)
+    token = Column(String(64), unique=True, index=True, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    product_id = Column(Integer, ForeignKey("products.id"), index=True, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    used_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=_utcnow)
+
+
+class EnrichJobStatus(StrEnum):
+    queued = "queued"
+    running = "running"
+    completed = "completed"
+    failed = "failed"
+
+
+class EnrichJob(Base):
+    """Job de enriquecimento em lote — progresso consultável pelo cliente."""
+
+    __tablename__ = "enrich_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    batch_id = Column(Integer, ForeignKey("import_batches.id"), index=True, nullable=False)
+    status = Column(SAEnum(EnrichJobStatus), default=EnrichJobStatus.queued, nullable=False)
+    total = Column(Integer, default=0, nullable=False)
+    processed = Column(Integer, default=0, nullable=False)
+    succeeded = Column(Integer, default=0, nullable=False)
+    failed = Column(Integer, default=0, nullable=False)
+    error_details = Column(Text, nullable=True)  # JSON
+    created_at = Column(DateTime, default=_utcnow)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
 
 
 class KBDocumentStatus(StrEnum):
@@ -222,6 +283,7 @@ class KBDocument(Base):
     __tablename__ = "kb_documents"
 
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     filename = Column(String(255), nullable=False)
     storage_path = Column(String(500), nullable=False)
     document_type = Column(String(80), default="parts_catalog", nullable=False)
@@ -231,6 +293,7 @@ class KBDocument(Base):
     error_message = Column(Text, nullable=True)
     created_at = Column(DateTime, default=_utcnow)
 
+    user = relationship("User")
     entries = relationship("KBEntry", back_populates="document", cascade="all, delete-orphan")
 
 
@@ -266,9 +329,13 @@ class KBCompatibility(Base):
 
 class AIProviderConfig(Base):
     __tablename__ = "ai_provider_configs"
+    __table_args__ = (
+        UniqueConstraint("user_id", "provider_id", name="uq_ai_provider_user"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
-    provider_id = Column(String(50), unique=True, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    provider_id = Column(String(50), nullable=False)
     api_key_encrypted = Column(Text, nullable=False)
     model = Column(String(120), nullable=False)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)

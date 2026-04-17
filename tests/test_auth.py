@@ -15,10 +15,11 @@ def test_auth_login_returns_url(client):
 
 
 def test_auth_callback_without_login(client, db):
-    """Callback sem ter feito login primeiro deve dar erro."""
-    resp = client.get("/auth/ml/callback?code=FAKE-CODE")
+    """Callback com state inválido deve dar erro (proteção HMAC/one-shot)."""
+    resp = client.get("/auth/ml/callback?code=FAKE-CODE&state=bogus-unsigned-state")
     assert resp.status_code == 400
-    assert "code_verifier" in resp.json()["detail"].lower() or "login" in resp.json()["detail"].lower()
+    detail = resp.json()["detail"].lower()
+    assert "state" in detail or "login" in detail
 
 
 def test_auth_login_persists_verifier(client, db):

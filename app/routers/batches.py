@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models import ImportBatch, ImportItem, ItemStatus, Product, User
 from app.schemas import BatchOut, ImportItemOut
-from app.services.auth import get_optional_user
+from app.services.auth import get_current_user
 
 router = APIRouter(prefix="/batches", tags=["batches"])
 
@@ -34,7 +34,7 @@ def parse_txt_content(raw_text: str) -> list[str]:
 async def import_oem_batch(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    user: User | None = Depends(get_optional_user),
+    user: User = Depends(get_current_user),
 ):
     if not file.filename.endswith(".txt"):
         raise HTTPException(status_code=400, detail="Envie um arquivo .txt")
@@ -51,7 +51,7 @@ async def import_oem_batch(
 
     batch = ImportBatch(
         filename=file.filename,
-        user_id=user.id if user else None,
+        user_id=user.id,
         total_items=len(oems),
         total_valid=len(oems),
         total_invalid=0,
@@ -70,17 +70,18 @@ async def import_oem_batch(
         db.flush()
 
         # Verifica duplicatas apenas do mesmo usuário
-        q = db.query(Product).filter(Product.oem == oem)
-        if user:
-            q = q.filter(Product.user_id == user.id)
-        existing_product = q.first()
+        existing_product = (
+            db.query(Product)
+            .filter(Product.oem == oem, Product.user_id == user.id)
+            .first()
+        )
         if existing_product:
             item.status = ItemStatus.awaiting_review
             continue
 
         product = Product(
             import_item_id=item.id,
-            user_id=user.id if user else None,
+            user_id=user.id,
             oem=oem,
             source_data="internal_seed",
             confidence_level=0,
@@ -96,17 +97,19 @@ async def import_oem_batch(
 @router.get("", response_model=list[BatchOut])
 def list_batches(
     db: Session = Depends(get_db),
-    user: User | None = Depends(get_optional_user),
+    user: User = Depends(get_current_user),
 ):
-    q = db.query(ImportBatch)
-    if user:
-        q = q.filter(ImportBatch.user_id == user.id)
-    return q.order_by(ImportBatch.id.desc()).all()
+    return (
+        db.query(ImportBatch)
+        .filter(ImportBatch.user_id == user.id)
+        .order_by(ImportBatch.id.desc())
+        .all()
+    )
 
 
 @router.get("/{batch_id}/items", response_model=list[ImportItemOut])
-def list_batch_items(batch_id: int, db: Session = Depends(get_db)):
-    batch = db.query(ImportBatch).filter(ImportBatch.id == batch_id).first()
+def list_batch_items(batch_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    batch = db.query(ImportBatch).filter(ImportBatch.id == batch_id, ImportBatch.user_id == user.id).first()
     if not batch:
         raise HTTPException(status_code=404, detail="Lote não encontrado")
 

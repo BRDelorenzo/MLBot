@@ -65,53 +65,70 @@ class ProviderConfig:
     model: str = ""
 
 
-# Cache em memória (carregado do banco)
-_provider_cache: dict[str, ProviderConfig] = {}
+# Cache em memória por (user_id, provider_id) com TTL curto.
+# Multi-worker: worker A rotaciona key → worker B recarrega do DB em até PROVIDER_CACHE_TTL.
+PROVIDER_CACHE_TTL = 60.0
+_provider_cache: dict[tuple[int, str], tuple[float, ProviderConfig]] = {}
 
 
-def _load_provider_from_db(provider_id: str, db: Session) -> ProviderConfig | None:
+def _load_provider_from_db(user_id: int, provider_id: str, db: Session) -> ProviderConfig | None:
     """Carrega config do banco e descriptografa a API key."""
     from app.models import AIProviderConfig
     from app.services.crypto import decrypt
 
-    row = db.query(AIProviderConfig).filter(AIProviderConfig.provider_id == provider_id).first()
+    row = (
+        db.query(AIProviderConfig)
+        .filter(AIProviderConfig.user_id == user_id, AIProviderConfig.provider_id == provider_id)
+        .first()
+    )
     if not row:
         return None
+    import time as _t
     cfg = ProviderConfig(api_key=decrypt(row.api_key_encrypted), model=row.model)
-    _provider_cache[provider_id] = cfg
+    _provider_cache[(user_id, provider_id)] = (_t.time(), cfg)
     return cfg
 
 
-def get_provider_config(provider_id: str, db: Session | None = None) -> ProviderConfig:
-    cached = _provider_cache.get(provider_id)
-    if cached and cached.api_key:
-        return cached
+def get_provider_config(user_id: int, provider_id: str, db: Session | None = None) -> ProviderConfig:
+    import time as _t
+
+    entry = _provider_cache.get((user_id, provider_id))
+    if entry:
+        ts, cfg = entry
+        if cfg.api_key and (_t.time() - ts) < PROVIDER_CACHE_TTL:
+            return cfg
     if db:
-        loaded = _load_provider_from_db(provider_id, db)
+        loaded = _load_provider_from_db(user_id, provider_id, db)
         if loaded:
             return loaded
     return ProviderConfig()
 
 
-def set_provider_config(provider_id: str, api_key: str, model: str | None = None, db: Session | None = None):
+def set_provider_config(user_id: int, provider_id: str, api_key: str, model: str | None = None, db: Session | None = None):
     if provider_id not in PROVIDERS:
         raise ValueError(f"Provider desconhecido: {provider_id}")
     if not model:
         model = PROVIDERS[provider_id]["default_model"]
 
+    import time as _t
     cfg = ProviderConfig(api_key=api_key, model=model)
-    _provider_cache[provider_id] = cfg
+    _provider_cache[(user_id, provider_id)] = (_t.time(), cfg)
 
     if db:
         from app.models import AIProviderConfig
         from app.services.crypto import encrypt
 
-        row = db.query(AIProviderConfig).filter(AIProviderConfig.provider_id == provider_id).first()
+        row = (
+            db.query(AIProviderConfig)
+            .filter(AIProviderConfig.user_id == user_id, AIProviderConfig.provider_id == provider_id)
+            .first()
+        )
         if row:
             row.api_key_encrypted = encrypt(api_key)
             row.model = model
         else:
             db.add(AIProviderConfig(
+                user_id=user_id,
                 provider_id=provider_id,
                 api_key_encrypted=encrypt(api_key),
                 model=model,
@@ -119,30 +136,34 @@ def set_provider_config(provider_id: str, api_key: str, model: str | None = None
         db.commit()
 
 
-def remove_provider_config(provider_id: str, db: Session | None = None):
-    _provider_cache.pop(provider_id, None)
+def remove_provider_config(user_id: int, provider_id: str, db: Session | None = None):
+    _provider_cache.pop((user_id, provider_id), None)
     if db:
         from app.models import AIProviderConfig
-        row = db.query(AIProviderConfig).filter(AIProviderConfig.provider_id == provider_id).first()
+        row = (
+            db.query(AIProviderConfig)
+            .filter(AIProviderConfig.user_id == user_id, AIProviderConfig.provider_id == provider_id)
+            .first()
+        )
         if row:
             db.delete(row)
             db.commit()
 
 
-def get_active_provider(db: Session | None = None) -> tuple[str, ProviderConfig] | None:
-    """Retorna o primeiro provider configurado com API key."""
+def get_active_provider(user_id: int, db: Session | None = None) -> tuple[str, ProviderConfig] | None:
+    """Retorna o primeiro provider configurado com API key para o usuário."""
     for pid in ("anthropic", "openai", "gemini"):
-        cfg = get_provider_config(pid, db)
+        cfg = get_provider_config(user_id, pid, db)
         if cfg and cfg.api_key:
             return pid, cfg
     return None
 
 
-def get_all_provider_status(db: Session | None = None) -> list[dict]:
-    """Retorna status de todos os providers."""
+def get_all_provider_status(user_id: int, db: Session | None = None) -> list[dict]:
+    """Retorna status de todos os providers para o usuário."""
     result = []
     for pid, info in PROVIDERS.items():
-        cfg = get_provider_config(pid, db)
+        cfg = get_provider_config(user_id, pid, db)
         has_key = bool(cfg.api_key)
         masked = ""
         if has_key:
@@ -158,6 +179,16 @@ def get_all_provider_status(db: Session | None = None) -> list[dict]:
             "selected_model": cfg.model or info["default_model"],
         })
     return result
+
+
+def invalidate_provider_cache(user_id: int | None = None):
+    """Invalida cache. Sem user_id, limpa tudo."""
+    if user_id is None:
+        _provider_cache.clear()
+    else:
+        for key in list(_provider_cache.keys()):
+            if key[0] == user_id:
+                _provider_cache.pop(key, None)
 
 
 # --- Prompts ---
@@ -313,13 +344,18 @@ def _get_honda_price(kb_entries: list[KBEntry]) -> float | None:
     return None
 
 
-def lookup_kb(oem: str, db: Session) -> list[KBEntry]:
+def lookup_kb(oem: str, db: Session, user_id: int | None = None) -> list[KBEntry]:
+    from app.models import KBDocument
+
     normalized = normalize_oem(oem)
-    return (
+    query = (
         db.query(KBEntry)
+        .join(KBDocument, KBEntry.document_id == KBDocument.id)
         .filter(KBEntry.oem_code_normalized == normalized)
-        .all()
     )
+    if user_id is not None:
+        query = query.filter(KBDocument.user_id == user_id)
+    return query.all()
 
 
 # --- Enrichment ---
@@ -385,13 +421,16 @@ def enrich_product(product: Product, db: Session, provider_id: str | None = None
 
     Se provider_id não for especificado, usa o primeiro provider configurado.
     """
-    # Resolve provider
+    if not product.user_id:
+        raise RuntimeError("Produto sem user_id não pode ser enriquecido.")
+
+    # Resolve provider (isolado por usuário)
     if provider_id:
-        cfg = get_provider_config(provider_id, db)
+        cfg = get_provider_config(product.user_id, provider_id, db)
         if not cfg.api_key:
             raise RuntimeError(f"API Key do provider '{provider_id}' não configurada. Vá em Base de Conhecimento > Configuração da IA.")
     else:
-        active = get_active_provider(db)
+        active = get_active_provider(product.user_id, db)
         if not active:
             raise RuntimeError(
                 "Nenhuma API Key configurada. "
@@ -402,7 +441,7 @@ def enrich_product(product: Product, db: Session, provider_id: str | None = None
     provider_name = PROVIDERS[provider_id]["name"]
 
     # 1. Busca na base de conhecimento
-    kb_entries = lookup_kb(product.oem, db)
+    kb_entries = lookup_kb(product.oem, db, user_id=product.user_id)
     source = f"kb+{provider_id}" if kb_entries else provider_id
 
     # 2. Monta o prompt

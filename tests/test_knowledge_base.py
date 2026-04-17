@@ -65,11 +65,12 @@ def test_kb_search_not_found(client):
     assert data["entries"] == []
 
 
-def test_kb_search_found(client, db):
+def test_kb_search_found(client, db, user_id):
     """Insere entry diretamente e busca."""
     from app.models import KBDocument, KBDocumentStatus, KBEntry
 
     doc = KBDocument(
+        user_id=user_id,
         filename="test.pdf",
         storage_path="/tmp/test.pdf",
         status=KBDocumentStatus.processed,
@@ -95,17 +96,21 @@ def test_kb_search_found(client, db):
     assert data["entries"][0]["honda_part_name"] == "COMP., R. FR. BRAKE DISK"
 
 
-def test_kb_delete_document(client, db):
+def test_kb_delete_document(client, db, user_id, tmp_path):
+    from app.config import settings
     from app.models import KBDocument, KBDocumentStatus
 
-    # Cria doc com arquivo temporário
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    tmp.write(b"fake pdf")
-    tmp.close()
+    # Cria arquivo dentro de kb_upload_dir — delete valida o prefixo por segurança.
+    kb_dir = tmp_path / "kb"
+    kb_dir.mkdir()
+    settings.kb_upload_dir = str(kb_dir)
+    tmp = kb_dir / "to_delete.pdf"
+    tmp.write_bytes(b"fake pdf")
 
     doc = KBDocument(
+        user_id=user_id,
         filename="to_delete.pdf",
-        storage_path=tmp.name,
+        storage_path=str(tmp),
         status=KBDocumentStatus.processed,
     )
     db.add(doc)
@@ -113,7 +118,7 @@ def test_kb_delete_document(client, db):
 
     resp = client.delete(f"/kb/documents/{doc.id}")
     assert resp.status_code == 200
-    assert not os.path.exists(tmp.name)
+    assert not tmp.exists()
 
 
 def test_kb_delete_not_found(client):
@@ -121,10 +126,11 @@ def test_kb_delete_not_found(client):
     assert resp.status_code == 404
 
 
-def test_kb_entries_list(client, db):
+def test_kb_entries_list(client, db, user_id):
     from app.models import KBDocument, KBDocumentStatus, KBEntry
 
     doc = KBDocument(
+        user_id=user_id,
         filename="entries_test.pdf",
         storage_path="/tmp/test.pdf",
         status=KBDocumentStatus.processed,
@@ -146,10 +152,11 @@ def test_kb_entries_list(client, db):
     assert len(resp.json()) == 3
 
 
-def test_kb_get_document(client, db):
+def test_kb_get_document(client, db, user_id):
     from app.models import KBDocument, KBDocumentStatus
 
     doc = KBDocument(
+        user_id=user_id,
         filename="detail.pdf",
         storage_path="/tmp/test.pdf",
         status=KBDocumentStatus.processed,

@@ -1,14 +1,19 @@
+import logging
 import os
 import secrets
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session, joinedload
 
 from app.config import settings
 from app.database import get_db
 from app.models import (
+    EnrichJob,
+    EnrichJobStatus,
     Image,
+    ImageAccessToken,
     ImageType,
     ImportItem,
     ItemStatus,
@@ -22,8 +27,15 @@ from app.models import (
 from app.models import _utcnow as utcnow
 from app.schemas import EnrichmentResult, PricingOut, PricingRequest, ProductOut, ProductUpdateIn
 from app.services.ai_enrichment import enrich_product as ai_enrich, lookup_kb, _get_honda_price
-from app.services.auth import get_current_user, get_optional_user
+from app.services.auth import get_current_user
+from app.services.enrich_jobs import enqueue_bulk_enrich
 from app.services.image_processing import remove_background
+
+from datetime import timedelta
+
+IMAGE_TOKEN_TTL_SECONDS = 300
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/products", tags=["products"])
 
@@ -31,8 +43,35 @@ MAX_IMAGE_BYTES = settings.max_image_size_mb * 1024 * 1024
 MAX_IMAGES_PER_REQUEST = 10
 
 
-def _ensure_upload_dir(product_oem: str) -> Path:
-    path = Path(settings.upload_dir) / product_oem
+def _get_user_product(
+    product_id: int, db: Session, user: User, *, eager: bool = False,
+) -> Product:
+    """Busca produto garantindo que pertence ao usuário autenticado."""
+    query = db.query(Product)
+    if eager:
+        query = query.options(
+            joinedload(Product.import_item),
+            joinedload(Product.compatibilities),
+            joinedload(Product.attributes),
+            joinedload(Product.images),
+            joinedload(Product.pricing),
+            joinedload(Product.listing),
+        )
+    product = query.filter(Product.id == product_id, Product.user_id == user.id).first()
+    if not product:
+        raise HTTPException(status_code=404, detail="Produto não encontrado")
+    return product
+
+
+def _ensure_upload_dir(user_id: int, product_oem: str) -> Path:
+    """Isolamento multi-tenant: uploads/{user_id}/{oem}/.
+
+    OEMs são compartilhados entre clientes (mesmo número Honda), então só
+    separar por OEM permite sobrescrita cross-tenant. user_id no path é
+    obrigatório.
+    """
+    safe_oem = Path(product_oem).name  # previne traversal
+    path = Path(settings.upload_dir) / str(user_id) / safe_oem
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -54,7 +93,7 @@ def calculate_suggested_price(
 def list_products(
     status: ItemStatus | None = Query(default=None),
     db: Session = Depends(get_db),
-    user: User | None = Depends(get_optional_user),
+    user: User = Depends(get_current_user),
 ):
     query = (
         db.query(Product)
@@ -67,39 +106,21 @@ def list_products(
             joinedload(Product.listing),
         )
         .join(ImportItem, Product.import_item_id == ImportItem.id)
+        .filter(Product.user_id == user.id)
     )
-    if user:
-        query = query.filter(Product.user_id == user.id)
     if status:
         query = query.filter(ImportItem.status == status)
     return query.order_by(Product.id.desc()).all()
 
 
 @router.get("/{product_id}", response_model=ProductOut)
-def get_product(product_id: int, db: Session = Depends(get_db)):
-    product = (
-        db.query(Product)
-        .options(
-            joinedload(Product.import_item),
-            joinedload(Product.compatibilities),
-            joinedload(Product.attributes),
-            joinedload(Product.images),
-            joinedload(Product.pricing),
-            joinedload(Product.listing),
-        )
-        .filter(Product.id == product_id)
-        .first()
-    )
-    if not product:
-        raise HTTPException(status_code=404, detail="Produto não encontrado")
-    return product
+def get_product(product_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    return _get_user_product(product_id, db, user, eager=True)
 
 
 @router.patch("/{product_id}", response_model=ProductOut)
 def update_product(product_id: int, payload: ProductUpdateIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    product = db.query(Product).filter(Product.id == product_id).first()
-    if not product:
-        raise HTTPException(status_code=404, detail="Produto não encontrado")
+    product = _get_user_product(product_id, db, user)
 
     data = payload.model_dump(exclude_unset=True)
     for field, value in data.items():
@@ -112,9 +133,7 @@ def update_product(product_id: int, payload: ProductUpdateIn, db: Session = Depe
 
 @router.post("/{product_id}/mock-enrich", response_model=ProductOut)
 def mock_enrich_product(product_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    product = db.query(Product).filter(Product.id == product_id).first()
-    if not product:
-        raise HTTPException(status_code=404, detail="Produto não encontrado")
+    product = _get_user_product(product_id, db, user)
 
     product.part_name = product.part_name or "Pastilha de Freio Dianteira"
     product.brand = product.brand or "Honda"
@@ -155,14 +174,7 @@ def ai_enrich_product(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    product = (
-        db.query(Product)
-        .options(joinedload(Product.compatibilities), joinedload(Product.attributes))
-        .filter(Product.id == product_id)
-        .first()
-    )
-    if not product:
-        raise HTTPException(status_code=404, detail="Produto não encontrado")
+    product = _get_user_product(product_id, db, user)
 
     import_item = db.query(ImportItem).filter(ImportItem.id == product.import_item_id).first()
     if import_item:
@@ -172,19 +184,26 @@ def ai_enrich_product(
     try:
         result = ai_enrich(product, db, provider_id=provider)
     except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        logger.exception("Erro de runtime no enriquecimento do produto %s", product_id)
+        raise HTTPException(status_code=500, detail="Erro no enriquecimento. Verifique a configuração do provider.") from exc
     except Exception as exc:
+        logger.exception("Erro inesperado no enriquecimento IA do produto %s", product_id)
         if import_item:
             import_item.status = ItemStatus.imported
             db.commit()
-        raise HTTPException(status_code=500, detail=f"Erro no enriquecimento IA: {exc}") from exc
+        raise HTTPException(status_code=500, detail="Erro interno no enriquecimento. Tente novamente.") from exc
 
     return result
 
 
 @router.post("/bulk-enrich")
 def bulk_ai_enrich(batch_id: int = Query(...), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    """Enriquece todos os produtos não-enriquecidos de um batch."""
+    """Enfileira enriquecimento em background e retorna job_id para polling."""
+    from app.models import ImportBatch
+    batch = db.query(ImportBatch).filter(ImportBatch.id == batch_id, ImportBatch.user_id == user.id).first()
+    if not batch:
+        raise HTTPException(status_code=404, detail="Lote não encontrado")
+
     items = (
         db.query(ImportItem)
         .filter(ImportItem.batch_id == batch_id)
@@ -195,35 +214,32 @@ def bulk_ai_enrich(batch_id: int = Query(...), db: Session = Depends(get_db), us
     if not items:
         raise HTTPException(status_code=404, detail="Nenhum item pendente para enriquecer neste lote")
 
-    results = []
-    errors = []
-    for item in items:
-        product = db.query(Product).filter(Product.import_item_id == item.id).first()
-        if not product:
-            continue
-        try:
-            result = ai_enrich(product, db)
-            results.append(result)
-        except Exception as exc:
-            errors.append({"oem": product.oem, "error": str(exc)})
+    job = EnrichJob(
+        user_id=user.id,
+        batch_id=batch_id,
+        status=EnrichJobStatus.queued,
+        total=len(items),
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    enqueue_bulk_enrich(job.id)
 
     return {
-        "enriched": len(results),
-        "errors": len(errors),
-        "error_details": errors,
-        "results": results,
+        "job_id": job.id,
+        "status": job.status.value,
+        "total": job.total,
     }
 
 
 @router.get("/{product_id}/pricing/info")
-def get_pricing_info(product_id: int, db: Session = Depends(get_db)):
+def get_pricing_info(product_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Retorna dados de pricing existentes + preço Honda da KB."""
-    product = db.query(Product).filter(Product.id == product_id).first()
-    if not product:
-        raise HTTPException(status_code=404, detail="Produto não encontrado")
+    product = _get_user_product(product_id, db, user)
 
     honda_price = None
-    kb_entries = lookup_kb(product.oem, db)
+    kb_entries = lookup_kb(product.oem, db, user_id=user.id)
     if kb_entries:
         honda_price = _get_honda_price(kb_entries)
 
@@ -242,9 +258,7 @@ def get_pricing_info(product_id: int, db: Session = Depends(get_db)):
 
 @router.post("/{product_id}/pricing/calculate", response_model=PricingOut)
 def calculate_pricing(product_id: int, payload: PricingRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    product = db.query(Product).filter(Product.id == product_id).first()
-    if not product:
-        raise HTTPException(status_code=404, detail="Produto não encontrado")
+    product = _get_user_product(product_id, db, user)
 
     try:
         suggested_price = calculate_suggested_price(
@@ -289,9 +303,7 @@ async def upload_product_images(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    product = db.query(Product).filter(Product.id == product_id).first()
-    if not product:
-        raise HTTPException(status_code=404, detail="Produto não encontrado")
+    product = _get_user_product(product_id, db, user)
 
     if not files:
         raise HTTPException(status_code=400, detail="Nenhuma imagem enviada")
@@ -299,7 +311,7 @@ async def upload_product_images(
     if len(files) > MAX_IMAGES_PER_REQUEST:
         raise HTTPException(status_code=400, detail=f"Máximo {MAX_IMAGES_PER_REQUEST} imagens por vez")
 
-    upload_dir = _ensure_upload_dir(product.oem)
+    upload_dir = _ensure_upload_dir(user.id, product.oem)
     next_index = len([img for img in product.images if img.image_type == ImageType.original]) + 1
     uploaded = []
 
@@ -362,17 +374,47 @@ async def upload_product_images(
     }
 
 
+@router.delete("/{product_id}/images/{image_id}")
+def delete_product_image(
+    product_id: int,
+    image_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Remove uma imagem do produto. Defense-in-depth: só deleta dentro de upload_dir."""
+    product = _get_user_product(product_id, db, user)
+
+    image = next((img for img in product.images if img.id == image_id), None)
+    if not image:
+        raise HTTPException(status_code=404, detail="Imagem não encontrada")
+
+    upload_root = Path(settings.upload_dir).resolve()
+    try:
+        file_path = Path(image.storage_path).resolve()
+        safe = file_path.is_relative_to(upload_root)
+    except (OSError, ValueError):
+        safe = False
+
+    if safe and file_path.exists():
+        try:
+            file_path.unlink()
+        except OSError:
+            logger.exception("Falha ao remover arquivo de imagem id=%s path=%s", image.id, file_path)
+    elif not safe:
+        logger.error(
+            "Tentativa de deletar imagem fora de upload_dir: id=%s path=%s",
+            image.id, image.storage_path,
+        )
+
+    db.delete(image)
+    db.commit()
+    return {"message": "Imagem removida", "id": image_id}
+
+
 @router.post("/{product_id}/images/process-background")
 def process_images_background(product_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Remove o fundo de todas as imagens originais e gera versões com fundo branco."""
-    product = (
-        db.query(Product)
-        .options(joinedload(Product.images))
-        .filter(Product.id == product_id)
-        .first()
-    )
-    if not product:
-        raise HTTPException(status_code=404, detail="Produto não encontrado")
+    product = _get_user_product(product_id, db, user)
 
     originals = [img for img in product.images if img.image_type == ImageType.original]
     if not originals:
@@ -387,7 +429,7 @@ def process_images_background(product_id: int, db: Session = Depends(get_db), us
 
     processed = []
     errors = []
-    upload_dir = _ensure_upload_dir(product.oem)
+    upload_dir = _ensure_upload_dir(user.id, product.oem)
 
     for img in originals:
         output_filename = f"{product.oem}_processed_{img.sort_order}.jpg"
@@ -425,3 +467,89 @@ def process_images_background(product_id: int, db: Session = Depends(get_db), us
         "processed": processed,
         "errors": errors,
     }
+
+
+@router.post("/{product_id}/images/access-token")
+def create_image_access_token(
+    product_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Emite um token short-lived para usar em <img src="...?access=xxx">.
+
+    Mantém o JWT longo no Authorization header, não na URL (onde vazaria em
+    logs de proxy/browser/referer).
+    """
+    product = _get_user_product(product_id, db, user)
+
+    token = secrets.token_urlsafe(32)
+    expires_at = utcnow() + timedelta(seconds=IMAGE_TOKEN_TTL_SECONDS)
+    db.add(
+        ImageAccessToken(
+            token=token,
+            user_id=user.id,
+            product_id=product.id,
+            expires_at=expires_at,
+        )
+    )
+    db.commit()
+    return {"access_token": token, "expires_in": IMAGE_TOKEN_TTL_SECONDS}
+
+
+@router.get("/{product_id}/images/{filename}")
+def serve_product_image(
+    product_id: int,
+    filename: str,
+    access: str | None = Query(default=None, alias="access"),
+    db: Session = Depends(get_db),
+):
+    """Serve imagens com token short-lived (uma passagem).
+
+    Fluxo:
+      1. Cliente chama POST /products/{id}/images/access-token (JWT no header)
+      2. Recebe access token e monta <img src="?access=...">
+      3. Este endpoint valida, marca usado e serve o arquivo.
+    """
+    if not access:
+        raise HTTPException(status_code=401, detail="Token de acesso à imagem obrigatório")
+
+    now = utcnow()
+    record = (
+        db.query(ImageAccessToken)
+        .filter(ImageAccessToken.token == access)
+        .first()
+    )
+    if not record:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    # Token é reutilizável dentro do TTL (5 min). Grid com N imagens precisa
+    # servir N requests com um único token — ainda é user+product scoped.
+    if record.expires_at <= now:
+        raise HTTPException(status_code=401, detail="Token expirado")
+    if record.product_id != product_id:
+        raise HTTPException(status_code=403, detail="Token não corresponde ao produto solicitado")
+
+    product = (
+        db.query(Product)
+        .filter(Product.id == product_id, Product.user_id == record.user_id)
+        .first()
+    )
+    if not product:
+        raise HTTPException(status_code=404, detail="Produto não encontrado")
+
+    safe_name = Path(filename).name  # previne path traversal
+    safe_oem = Path(product.oem).name
+    file_path = Path(settings.upload_dir) / str(product.user_id) / safe_oem / safe_name
+    # Fallback para estrutura antiga (pré-migração) — remove após rodar o script
+    if not file_path.exists():
+        legacy_path = Path(settings.upload_dir) / safe_oem / safe_name
+        if legacy_path.exists():
+            file_path = legacy_path
+        else:
+            raise HTTPException(status_code=404, detail="Imagem não encontrada")
+
+    # used_at mantido para telemetria/auditoria — não bloqueia reuso.
+    if record.used_at is None:
+        record.used_at = now
+        db.commit()
+
+    return FileResponse(file_path)

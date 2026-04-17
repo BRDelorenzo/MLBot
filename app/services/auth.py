@@ -1,5 +1,6 @@
 """Serviço de autenticação — registro, login, JWT."""
 
+import logging
 from datetime import UTC, datetime, timedelta
 
 import bcrypt
@@ -8,9 +9,12 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
+logger = logging.getLogger(__name__)
+
 from app.config import settings
 from app.database import get_db
-from app.models import User
+from app.models import User, UserRole
+from app.services.password_policy import validate_password
 
 security = HTTPBearer(auto_error=False)
 
@@ -29,9 +33,13 @@ def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12)).decode()
 
 
+def is_legacy_hash(password_hash: str) -> bool:
+    return ":" in password_hash and len(password_hash) == 97
+
+
 def verify_password(password: str, password_hash: str) -> bool:
     # Suporte a hashes legados SHA-256 (salt:hex) para migração
-    if ":" in password_hash and len(password_hash) == 97:
+    if is_legacy_hash(password_hash):
         from hashlib import sha256
         salt, h = password_hash.split(":", 1)
         if sha256(f"{salt}{password}".encode()).hexdigest() == h:
@@ -60,13 +68,19 @@ def decode_token(token: str) -> dict:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token inválido")
 
 
+class EmailAlreadyRegistered(Exception):
+    """Sinaliza que o email já existe — o router decide se responde genérico."""
+
+
 def register_user(name: str, email: str, password: str, db: Session) -> User:
+    # Valida senha ANTES de tocar no DB — evita vazar existência via timing de
+    # query. A mensagem de política é pública e não revela nada sobre o email.
+    validate_password(password)
+
     existing = db.query(User).filter(User.email == email).first()
     if existing:
-        raise HTTPException(status_code=400, detail="Email já cadastrado")
-
-    if len(password) < 6:
-        raise HTTPException(status_code=400, detail="Senha deve ter no mínimo 6 caracteres")
+        logger.info("register: tentativa com email já cadastrado (enum blocked)")
+        raise EmailAlreadyRegistered
 
     user = User(
         name=name,
@@ -83,6 +97,19 @@ def authenticate_user(email: str, password: str, db: Session) -> User:
     user = db.query(User).filter(User.email == email).first()
     if not user or not verify_password(password, user.password_hash):
         raise HTTPException(status_code=401, detail="Email ou senha inválidos")
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="Conta desativada")
+
+    # Migração transparente: senha legada SHA-256 bateu → rehash para bcrypt
+    if is_legacy_hash(user.password_hash):
+        try:
+            user.password_hash = hash_password(password)
+            db.commit()
+            logger.info("Hash legado SHA-256 migrado para bcrypt: user_id=%s", user.id)
+        except Exception:
+            db.rollback()
+            logger.exception("Falha ao migrar hash legado do user_id=%s", user.id)
+
     return user
 
 
@@ -98,7 +125,21 @@ def get_current_user(
     user = db.query(User).filter(User.id == int(payload["sub"])).first()
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Usuário não encontrado")
+    if not user.is_active:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Conta desativada")
     return user
+
+
+def require_role(*roles: UserRole):
+    """Dependência que exige um dos roles informados. Use em rotas admin/debug."""
+    allowed = {r.value if isinstance(r, UserRole) else r for r in roles}
+
+    def _checker(user: User = Depends(get_current_user)) -> User:
+        if (user.role.value if hasattr(user.role, "value") else user.role) not in allowed:
+            raise HTTPException(status_code=403, detail="Acesso negado: role insuficiente")
+        return user
+
+    return _checker
 
 
 def get_optional_user(

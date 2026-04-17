@@ -42,8 +42,13 @@ async function api(path, opts = {}) {
       renderAuth();
       throw new Error('Sessão expirada');
     }
-    const msg = data?.detail || `Erro ${res.status}`;
-    throw new Error(msg);
+    let msg = data?.detail ?? `Erro ${res.status}`;
+    if (Array.isArray(msg)) {
+      msg = msg.map(e => e?.msg || JSON.stringify(e)).join('; ');
+    } else if (typeof msg === 'object') {
+      msg = msg.msg || JSON.stringify(msg);
+    }
+    throw new Error(String(msg));
   }
   return data;
 }
@@ -422,8 +427,12 @@ function cardActionClose(productId) {
   if (area) area.innerHTML = '';
 }
 
-function cardActionArea(productId, html) {
+// Rastreia qual painel (upload, background, etc.) está aberto por produto,
+// para que ações como deletar imagem possam re-abrir o mesmo painel após refresh.
+const _openCardPanel = {};
+function cardActionArea(productId, html, panel) {
   const area = document.getElementById(`pcard-action-${productId}`);
+  if (panel) _openCardPanel[productId] = panel;
   if (area) area.innerHTML = `
     <div class="product-card-action">
       <button class="action-close" onclick="cardActionClose(${productId})">&times;</button>
@@ -554,16 +563,37 @@ async function submitCardPricing(productId) {
 }
 
 // --- Image preview helper ---
-function renderExistingImages(product, type) {
+// Cache de access-tokens por produto (TTL curto, reaproveitado enquanto válido).
+const _imageAccessTokens = {};
+
+async function getImageAccessToken(productId) {
+  const cached = _imageAccessTokens[productId];
+  if (cached && cached.expiresAt > Date.now() + 5000) {
+    return cached.token;
+  }
+  const resp = await apiPost(`/products/${productId}/images/access-token`, {});
+  _imageAccessTokens[productId] = {
+    token: resp.access_token,
+    expiresAt: Date.now() + (resp.expires_in || 60) * 1000,
+  };
+  return resp.access_token;
+}
+
+function renderExistingImages(product, type, accessToken) {
   const imgs = (product.images || []).filter(i => i.image_type === type);
   if (!imgs.length) return '';
+  const tok = encodeURIComponent(accessToken || '');
   return `
     <div style="margin-bottom:var(--space-3)">
       <span style="font-size:12px;color:var(--text-secondary)"><strong>${imgs.length}</strong> imagem(ns) ${type === 'processed' ? 'processada(s)' : 'original(is)'}</span>
       <div class="image-grid" style="margin-top:var(--space-2)">
         ${imgs.map(img => `
           <div class="image-thumb">
-            <img src="/uploads/${encodeURIComponent(product.oem)}/${encodeURIComponent(img.filename)}" alt="${escapeHtml(img.filename)}">
+            <img src="${API}/products/${product.id}/images/${encodeURIComponent(img.filename)}?access=${tok}" alt="${escapeHtml(img.filename)}" loading="lazy">
+            <button type="button" class="image-thumb-delete"
+              onclick="deleteProductImage(${product.id}, ${img.id})"
+              title="Remover imagem"
+              aria-label="Remover imagem">&times;</button>
           </div>
         `).join('')}
       </div>
@@ -571,14 +601,37 @@ function renderExistingImages(product, type) {
   `;
 }
 
+async function deleteProductImage(productId, imageId) {
+  if (!confirm('Remover esta imagem?')) return;
+  try {
+    await api(`/products/${productId}/images/${imageId}`, { method: 'DELETE' });
+    toast('Imagem removida', 'success');
+    const panel = _openCardPanel[productId];
+    await refreshCard(productId);
+    // Re-abre o mesmo painel para mostrar a grade atualizada.
+    if (panel === 'upload') cardActionImageUpload(productId);
+    else if (panel === 'background') cardActionBackground(productId);
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
 function getLocalProduct(productId) {
   return products.find(p => p.id === productId);
 }
 
 // Step 2 — Upload de Imagens
-function cardActionImageUpload(productId) {
+async function cardActionImageUpload(productId) {
   const product = getLocalProduct(productId);
-  const existingHtml = product ? renderExistingImages(product, 'original') : '';
+  let existingHtml = '';
+  if (product && (product.images || []).some(i => i.image_type === 'original')) {
+    try {
+      const tok = await getImageAccessToken(productId);
+      existingHtml = renderExistingImages(product, 'original', tok);
+    } catch (err) {
+      existingHtml = `<div style="color:var(--error);font-size:12px">Falha ao carregar imagens: ${escapeHtml(err.message)}</div>`;
+    }
+  }
 
   cardActionArea(productId, `
     <h3 style="margin-bottom:var(--space-3)">Upload de Imagens</h3>
@@ -591,7 +644,7 @@ function cardActionImageUpload(productId) {
     <input type="file" id="img-input-${productId}" accept="image/*" multiple style="display:none" onchange="previewCardImages(${productId}, this)">
     <div id="img-preview-${productId}" style="margin-top:var(--space-3)"></div>
     <div id="img-result-${productId}"></div>
-  `);
+  `, 'upload');
 
   const zone = document.getElementById(`img-zone-${productId}`);
   zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('dragover'); });
@@ -652,8 +705,16 @@ async function submitCardImages(productId) {
 // Step 3 — Tratar Fundo
 async function cardActionBackground(productId) {
   const product = getLocalProduct(productId);
-  const processedHtml = product ? renderExistingImages(product, 'processed') : '';
-  const originalHtml = product ? renderExistingImages(product, 'original') : '';
+  let processedHtml = '', originalHtml = '';
+  if (product && (product.images || []).length) {
+    try {
+      const tok = await getImageAccessToken(productId);
+      processedHtml = renderExistingImages(product, 'processed', tok);
+      originalHtml = renderExistingImages(product, 'original', tok);
+    } catch (err) {
+      processedHtml = `<div style="color:var(--error);font-size:12px">Falha ao carregar imagens: ${escapeHtml(err.message)}</div>`;
+    }
+  }
   const hasProcessed = product && (product.images || []).some(i => i.image_type === 'processed');
 
   cardActionArea(productId, `
@@ -663,7 +724,7 @@ async function cardActionBackground(productId) {
       ${hasProcessed ? 'Reprocessar Fundo' : 'Remover Fundo'}
     </button>
     <div id="bg-result-${productId}" style="margin-top:var(--space-3)"></div>
-  `);
+  `, 'background');
 }
 
 async function execBackground(productId) {
@@ -722,8 +783,19 @@ async function cardActionValidate(productId) {
       cardActionArea(productId, `<div class="action-result success"><strong>Anúncio validado</strong> — pronto para publicar</div>`);
       toast('Validado com sucesso', 'success');
     } else {
-      cardActionArea(productId, `<div class="action-result error"><strong>Falha na validação:</strong> ${result.errors.join(', ')}</div>`);
-      toast('Validação falhou', 'error');
+      const errs = result.errors || [];
+      cardActionArea(productId, `
+        <div class="action-result error">
+          <strong>Falha na validação:</strong>
+          <ul style="margin:var(--space-2) 0 0 var(--space-4);padding:0">
+            ${errs.map(e => `<li>${escapeHtml(e)}</li>`).join('')}
+          </ul>
+        </div>
+      `);
+      // Mostra a primeira causa direto no toast para o usuário entender sem olhar o card.
+      const first = errs[0] || 'Produto incompleto';
+      const suffix = errs.length > 1 ? ` (+${errs.length - 1})` : '';
+      toast(`Validação falhou: ${first}${suffix}`, 'error');
     }
     await refreshCard(productId);
   } catch (err) {
@@ -1179,18 +1251,19 @@ async function startAuth() {
     const area = document.getElementById('auth-code-area');
     area.innerHTML = `
       <div class="card" style="max-width:520px">
-        <h2 class="section-header">2. Cole o código de autorização</h2>
+        <h2 class="section-header">2. Cole a URL de redirect</h2>
         <p style="color:var(--text-tertiary);font-size:13px;margin-bottom:var(--space-4)">
-          Após autorizar no Mercado Livre, você será redirecionado. Copie o <strong>code</strong> da URL
-          (o valor após <span class="mono">?code=</span>) e cole abaixo.
+          Após autorizar no Mercado Livre você será redirecionado. Copie a
+          <strong>URL completa</strong> da barra do navegador (precisa conter
+          <span class="mono">code=</span> e <span class="mono">state=</span>) e cole abaixo.
         </p>
         <div class="flex gap-3">
           <input type="text" id="auth-code-input" class="form-input" style="flex:1"
-            placeholder="TG-xxxxxxxxxxxx-xxxxxxxxx">
+            placeholder="http://localhost:8000/auth/ml/callback?code=TG-...&state=...">
           <button class="btn btn-primary" onclick="submitAuthCode()">Conectar</button>
         </div>
         <p style="color:var(--text-tertiary);font-size:11px;margin-top:var(--space-3)">
-          Dica: se a URL de redirect foi <span class="mono">https://...?code=TG-abc123</span>, cole apenas <span class="mono">TG-abc123</span>
+          Dica: aceita também só a query string <span class="mono">code=TG-...&state=...</span>
         </p>
         <div id="auth-code-result" class="mt-4"></div>
       </div>
@@ -1202,21 +1275,34 @@ async function startAuth() {
 
 async function submitAuthCode() {
   const input = document.getElementById('auth-code-input');
-  let code = input.value.trim();
-  if (!code) { toast('Cole o código de autorização', 'error'); return; }
+  let raw = input.value.trim();
+  if (!raw) { toast('Cole o código de autorização', 'error'); return; }
 
-  // Se o usuário colou a URL inteira, extrai o code
-  if (code.includes('?code=')) {
-    code = new URL(code).searchParams.get('code') || code;
-  } else if (code.includes('code=')) {
-    code = code.split('code=')[1].split('&')[0];
+  // Se o usuário colou a URL inteira (ou query string), extrai code + state.
+  // state é obrigatório — o backend valida HMAC e impede CSRF/replay.
+  let code = raw, state = '';
+  try {
+    if (raw.includes('?')) {
+      const u = new URL(raw);
+      code = u.searchParams.get('code') || raw;
+      state = u.searchParams.get('state') || '';
+    } else if (raw.includes('=')) {
+      const params = new URLSearchParams(raw);
+      code = params.get('code') || raw;
+      state = params.get('state') || '';
+    }
+  } catch { /* fallback: trata como code puro */ }
+
+  if (!state) {
+    toast('Cole a URL completa de redirect (precisa conter state=...)', 'error');
+    return;
   }
 
   const result = document.getElementById('auth-code-result');
   result.innerHTML = '<div class="flex items-center gap-2"><div class="spinner"></div> Trocando code por token...</div>';
 
   try {
-    await api(`/auth/ml/callback?code=${encodeURIComponent(code)}`);
+    await api(`/auth/ml/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`);
     toast('Mercado Livre conectado com sucesso!', 'success');
     updateAuthStatus();
     navigate('auth');

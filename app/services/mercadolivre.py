@@ -3,6 +3,7 @@
 import hashlib
 import logging
 import secrets
+import threading
 from base64 import urlsafe_b64encode
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode
@@ -13,6 +14,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models import MLCredential
 from app.services.crypto import decrypt, encrypt
+from app.services.oauth_state import InvalidStateError, sign_state, verify_state
 
 logger = logging.getLogger(__name__)
 
@@ -46,14 +48,16 @@ def _generate_pkce() -> tuple[str, str]:
     return code_verifier, code_challenge
 
 
-def get_auth_url(db: Session) -> str:
+def get_auth_url(db: Session, user_id: int) -> str:
     code_verifier, code_challenge = _generate_pkce()
-    oauth_state = secrets.token_urlsafe(32)
+    # State assinado com HMAC: só quem conhece jwt_secret consegue forjar.
+    oauth_state = sign_state(user_id)
 
-    # Persiste o verifier e state no banco para sobreviver a restarts e múltiplos workers
-    credential = db.query(MLCredential).first()
+    # Persiste o verifier e state por usuário (one-shot no callback)
+    credential = db.query(MLCredential).filter(MLCredential.user_id == user_id).first()
     if not credential:
         credential = MLCredential(
+            user_id=user_id,
             access_token_encrypted="",
             refresh_token_encrypted="",
             expires_at=_utcnow(),
@@ -75,14 +79,26 @@ def get_auth_url(db: Session) -> str:
 
 
 def exchange_code_for_token(code: str, db: Session, state: str | None = None) -> MLCredential:
-    credential = db.query(MLCredential).first()
+    # 1. Valida HMAC do state — impede forja/replay cross-user
+    if not state:
+        raise MLAPIError(400, "Parâmetro state obrigatório para segurança OAuth.")
+
+    try:
+        user_id = verify_state(state)
+    except InvalidStateError as exc:
+        logger.warning("Tentativa de callback OAuth ML com state inválido: %s", exc)
+        raise MLAPIError(400, "State OAuth inválido ou expirado.") from exc
+
+    # 2. Busca credencial pelo user_id + state (one-shot: state só é válido se
+    #    ainda estiver armazenado; qualquer reuso encontra oauth_state=None).
+    credential = (
+        db.query(MLCredential)
+        .filter(MLCredential.user_id == user_id, MLCredential.oauth_state == state)
+        .first()
+    )
 
     if not credential or not credential.pkce_verifier:
-        raise MLAPIError(400, "Nenhum code_verifier encontrado. Acesse /auth/ml/login primeiro para iniciar o fluxo.")
-
-    # Valida state para prevenir CSRF
-    if credential.oauth_state and state != credential.oauth_state:
-        raise MLAPIError(400, "State inválido. Possível ataque CSRF. Reinicie o fluxo de login.")
+        raise MLAPIError(400, "State não corresponde a um fluxo ativo. Reinicie em /auth/ml/login.")
 
     code_verifier = decrypt(credential.pkce_verifier)
 
@@ -118,6 +134,23 @@ def exchange_code_for_token(code: str, db: Session, state: str | None = None) ->
     return credential
 
 
+# Locks por user_id para serializar refresh_token dentro do mesmo processo.
+# Nota: em multi-worker (gunicorn), este lock não cobre entre processos — um
+# lock cross-process via Redis/Postgres SELECT FOR UPDATE entra quando A4 for
+# feito. Mesmo assim, isso já elimina a race mais comum (mesmo worker).
+_refresh_locks_master = threading.Lock()
+_refresh_locks: dict[int, threading.Lock] = {}
+
+
+def _lock_for_user(user_id: int) -> threading.Lock:
+    with _refresh_locks_master:
+        lock = _refresh_locks.get(user_id)
+        if lock is None:
+            lock = threading.Lock()
+            _refresh_locks[user_id] = lock
+        return lock
+
+
 def _refresh_token(credential: MLCredential, db: Session) -> MLCredential:
     current_refresh_token = decrypt(credential.refresh_token_encrypted)
 
@@ -145,13 +178,25 @@ def _refresh_token(credential: MLCredential, db: Session) -> MLCredential:
     return credential
 
 
-def get_valid_token(db: Session) -> str:
-    credential = db.query(MLCredential).first()
+def get_valid_token(db: Session, user_id: int) -> str:
+    """Recupera token ML válido do usuário; nunca anônimo para evitar cross-tenant."""
+    if not isinstance(user_id, int):
+        raise TypeError("get_valid_token exige user_id explícito (int).")
+
+    credential = (
+        db.query(MLCredential).filter(MLCredential.user_id == user_id).first()
+    )
     if not credential or not credential.access_token_encrypted:
         raise MLAPIError(401, "Nenhuma credencial ML encontrada. Faça a autenticação em /auth/ml/login")
 
     if _utcnow() >= credential.expires_at:
-        credential = _refresh_token(credential, db)
+        # Serializa refresh por usuário para evitar duas threads invalidarem
+        # o refresh_token uma da outra. Double-check após adquirir o lock.
+        lock = _lock_for_user(credential.user_id)
+        with lock:
+            db.refresh(credential)
+            if _utcnow() >= credential.expires_at:
+                credential = _refresh_token(credential, db)
 
     return decrypt(credential.access_token_encrypted)
 
@@ -236,6 +281,28 @@ def publish_item(
     return result
 
 
+def search_item_by_seller_sku(access_token: str, seller_id: str, sku: str) -> list[str]:
+    """Retorna lista de `ml_item_id`s do seller que possuem `seller_sku = sku`.
+
+    A API do ML devolve `results: list[str]` (IDs). Detecta duplicata antes de
+    publicar (defesa contra retry após sucesso no ML + falha no commit local).
+    """
+    if not seller_id or not sku:
+        return []
+    client = _get_http_client()
+    resp = client.get(
+        f"{settings.ml_api_base_url}/users/{seller_id}/items/search",
+        params={"seller_sku": sku},
+        headers=_auth_headers(access_token),
+    )
+    if resp.status_code != 200:
+        logger.warning("Busca por seller_sku %s falhou: %s", sku, resp.status_code)
+        return []
+    results = resp.json().get("results", []) or []
+    # Defensivo: se algum dia vier lista de dicts, extrai o id.
+    return [r if isinstance(r, str) else r.get("id") for r in results if r]
+
+
 def predict_category(title: str) -> dict:
     client = _get_http_client()
     resp = client.get(
@@ -265,11 +332,27 @@ def get_categories() -> list[dict]:
     return resp.json()
 
 
+_CATEGORY_ATTRS_CACHE: dict[str, tuple[float, list[dict]]] = {}
+_CATEGORY_ATTRS_TTL = 24 * 3600  # 24h
+
+
 def get_category_attributes(category_id: str) -> list[dict]:
+    """Busca atributos da categoria ML com cache de 24h.
+
+    Evita chamar o ML em todo validate/publish — reduz latência e falha menos.
+    """
+    import time as _t
+
+    cached = _CATEGORY_ATTRS_CACHE.get(category_id)
+    if cached and _t.time() - cached[0] < _CATEGORY_ATTRS_TTL:
+        return cached[1]
+
     client = _get_http_client()
     resp = client.get(f"{settings.ml_api_base_url}/categories/{category_id}/attributes")
 
     if resp.status_code != 200:
         raise MLAPIError(resp.status_code, f"Erro ao buscar atributos: {resp.text}")
 
-    return resp.json()
+    data = resp.json()
+    _CATEGORY_ATTRS_CACHE[category_id] = (_t.time(), data)
+    return data

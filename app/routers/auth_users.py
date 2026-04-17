@@ -1,12 +1,19 @@
 """Endpoints de autenticação de usuários — registro e login."""
 
 from fastapi import APIRouter, Depends, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import User
-from app.services.auth import authenticate_user, create_token, get_current_user, register_user
+from app.services.auth import (
+    EmailAlreadyRegistered,
+    authenticate_user,
+    create_token,
+    get_current_user,
+    register_user,
+)
 from app.services.rate_limit import get_client_ip, login_limiter, register_limiter
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -35,10 +42,21 @@ class UserOut(BaseModel):
     role: str
 
 
-@router.post("/register", response_model=AuthResponse)
+@router.post("/register")
 def register(payload: RegisterRequest, request: Request, db: Session = Depends(get_db)):
     register_limiter.check(get_client_ip(request))
-    user = register_user(payload.name, payload.email, payload.password, db)
+    try:
+        user = register_user(payload.name, payload.email, payload.password, db)
+    except EmailAlreadyRegistered:
+        # Resposta idêntica à de sucesso "pendente" — não revela se email existe.
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "pending",
+                "message": "Se o email for válido, verifique sua caixa de entrada.",
+            },
+        )
+
     token = create_token(user)
     return {
         "token": token,

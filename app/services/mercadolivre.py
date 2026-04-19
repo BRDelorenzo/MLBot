@@ -111,10 +111,28 @@ def exchange_code_for_token(code: str, db: Session, state: str | None = None) ->
         "code_verifier": code_verifier,
     }
 
+    secret = settings.ml_client_secret or ""
+    logger.info(
+        "ML token exchange debug | client_id=%r | redirect_uri=%r | secret_len=%d | "
+        "secret_has_ws=%s | code_len=%d | code_verifier_len=%d | api_base=%r",
+        settings.ml_app_id,
+        settings.ml_redirect_uri,
+        len(secret),
+        secret != secret.strip(),
+        len(code),
+        len(code_verifier),
+        settings.ml_api_base_url,
+    )
+
     client = _get_http_client()
     resp = client.post(f"{settings.ml_api_base_url}/oauth/token", json=payload)
 
     if resp.status_code != 200:
+        logger.warning(
+            "ML token exchange rejected | status=%d | body=%r",
+            resp.status_code,
+            resp.text,
+        )
         raise MLAPIError(resp.status_code, f"Erro ao obter token: {resp.text}")
 
     data = resp.json()

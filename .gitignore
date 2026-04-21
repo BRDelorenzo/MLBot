@@ -48,3 +48,4 @@ passo_passo_producao.md
 
 # Claude Code — config local (permissões Bash e paths absolutos por máquina)
 .claude/settings.local.json
+cloudflared.exe

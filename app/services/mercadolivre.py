@@ -133,7 +133,18 @@ def exchange_code_for_token(code: str, db: Session, state: str | None = None) ->
             resp.status_code,
             resp.text,
         )
-        raise MLAPIError(resp.status_code, f"Erro ao obter token: {resp.text}")
+        # Diagnóstico TEMPORÁRIO inline — logs Python não visíveis no Render.
+        # Remover após resolver invalid_grant. Não expõe secret nem code completo.
+        verifier_fp = f"{code_verifier[:4]}...{code_verifier[-4:]}" if len(code_verifier) >= 8 else "??"
+        code_fp = f"{code[:4]}...{code[-4:]}" if len(code) >= 8 else "??"
+        diag = (
+            f" [diag: app_id={settings.ml_app_id!r} "
+            f"redirect={settings.ml_redirect_uri!r} "
+            f"secret_len={len(secret)} secret_ws={secret != secret.strip()} "
+            f"code={code_fp} code_len={len(code)} "
+            f"verifier={verifier_fp} verifier_len={len(code_verifier)}]"
+        )
+        raise MLAPIError(resp.status_code, f"Erro ao obter token: {resp.text}{diag}")
 
     data = resp.json()
     expires_at = _utcnow() + timedelta(seconds=data["expires_in"])

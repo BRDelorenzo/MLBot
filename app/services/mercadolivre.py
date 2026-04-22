@@ -125,7 +125,7 @@ def exchange_code_for_token(code: str, db: Session, state: str | None = None) ->
     )
 
     client = _get_http_client()
-    resp = client.post(f"{settings.ml_api_base_url}/oauth/token", json=payload)
+    resp = client.post(f"{settings.ml_api_base_url}/oauth/token", data=payload)
 
     if resp.status_code != 200:
         logger.warning(
@@ -180,7 +180,7 @@ def _refresh_token(credential: MLCredential, db: Session) -> MLCredential:
     }
 
     client = _get_http_client()
-    resp = client.post(f"{settings.ml_api_base_url}/oauth/token", json=payload)
+    resp = client.post(f"{settings.ml_api_base_url}/oauth/token", data=payload)
 
     if resp.status_code != 200:
         raise MLAPIError(resp.status_code, f"Erro ao renovar token: {resp.text}")

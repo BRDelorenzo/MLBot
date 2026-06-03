@@ -1,4 +1,5 @@
 import logging
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import RedirectResponse
@@ -35,7 +36,10 @@ def ml_callback(
         exchange_code_for_token(code, db, state=state)
     except MLAPIError as exc:
         logger.warning("Callback OAuth ML falhou: %s", exc.detail)
-        return RedirectResponse(url="/?ml=error", status_code=303)
+        # detail TEMPORÁRIO na URL para diagnóstico (logs do Render pouco acessíveis).
+        # Trocar por mensagem genérica após resolver. Não expõe secret.
+        reason = quote((exc.detail or "")[:300])
+        return RedirectResponse(url=f"/?ml=error&ml_detail={reason}", status_code=303)
 
     return RedirectResponse(url="/?ml=connected", status_code=303)
 

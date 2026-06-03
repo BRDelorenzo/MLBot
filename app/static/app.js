@@ -1422,9 +1422,12 @@ function handleMlCallbackResult() {
     toast('Mercado Livre conectado com sucesso!', 'success');
     updateAuthStatus();
   } else if (ml === 'error') {
-    toast('Falha ao conectar o Mercado Livre. Tente novamente.', 'error');
+    const detail = params.get('ml_detail');
+    if (detail) console.error('[ML OAuth] Falha:', detail);
+    toast(detail ? `Falha ao conectar o ML: ${detail}` : 'Falha ao conectar o Mercado Livre. Tente novamente.', 'error');
   }
   params.delete('ml');
+  params.delete('ml_detail');
   const qs = params.toString();
   window.history.replaceState({}, '', window.location.pathname + (qs ? '?' + qs : ''));
 }

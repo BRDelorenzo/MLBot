@@ -15,11 +15,18 @@ def test_auth_login_returns_url(client):
 
 
 def test_auth_callback_without_login(client, db):
-    """Callback com state inválido deve dar erro (proteção HMAC/one-shot)."""
-    resp = client.get("/auth/ml/callback?code=FAKE-CODE&state=bogus-unsigned-state")
-    assert resp.status_code == 400
-    detail = resp.json()["detail"].lower()
-    assert "state" in detail or "login" in detail
+    """Callback com state inválido não autentica (proteção HMAC/one-shot).
+
+    O endpoint é de redirect do browser: rejeita redirecionando para /?ml=error,
+    nunca para /?ml=connected.
+    """
+    resp = client.get(
+        "/auth/ml/callback?code=FAKE-CODE&state=bogus-unsigned-state",
+        follow_redirects=False,
+    )
+    assert resp.status_code in (302, 303, 307)
+    assert "ml=error" in resp.headers["location"]
+    assert "ml=connected" not in resp.headers["location"]
 
 
 def test_auth_login_persists_verifier(client, db):

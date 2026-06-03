@@ -1,11 +1,12 @@
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import MLCredential, User
-from app.schemas import MLAuthURL, MLTokenOut
+from app.schemas import MLAuthURL
 from app.services.auth import get_current_user
 from app.services.mercadolivre import MLAPIError, exchange_code_for_token, get_auth_url
 
@@ -19,18 +20,24 @@ def ml_login(db: Session = Depends(get_db), user: User = Depends(get_current_use
     return {"auth_url": get_auth_url(db, user.id)}
 
 
-@router.get("/callback", response_model=MLTokenOut)
+@router.get("/callback")
 def ml_callback(
     code: str = Query(...),
     state: str = Query(...),
     db: Session = Depends(get_db),
 ):
-    try:
-        credential = exchange_code_for_token(code, db, state=state)
-    except MLAPIError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    """Endpoint de redirect do OAuth ML (navegação do browser).
 
-    return credential
+    Faz a troca do code por token uma única vez e redireciona o usuário de volta
+    para a interface — nunca devolve JSON cru, evitando o consumo duplo do code.
+    """
+    try:
+        exchange_code_for_token(code, db, state=state)
+    except MLAPIError as exc:
+        logger.warning("Callback OAuth ML falhou: %s", exc.detail)
+        return RedirectResponse(url="/?ml=error", status_code=303)
+
+    return RedirectResponse(url="/?ml=connected", status_code=303)
 
 
 @router.get("/status")

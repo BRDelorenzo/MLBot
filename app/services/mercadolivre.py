@@ -74,6 +74,9 @@ def get_auth_url(db: Session, user_id: int) -> str:
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
         "state": oauth_state,
+        # offline_access é obrigatório para o ML devolver refresh_token; sem ele
+        # a resposta do /oauth/token não traz refresh_token e a troca quebra.
+        "scope": "offline_access read write",
     }
     return f"{settings.ml_auth_url}?{urlencode(params)}"
 
@@ -111,19 +114,6 @@ def exchange_code_for_token(code: str, db: Session, state: str | None = None) ->
         "code_verifier": code_verifier,
     }
 
-    secret = settings.ml_client_secret or ""
-    logger.info(
-        "ML token exchange debug | client_id=%r | redirect_uri=%r | secret_len=%d | "
-        "secret_has_ws=%s | code_len=%d | code_verifier_len=%d | api_base=%r",
-        settings.ml_app_id,
-        settings.ml_redirect_uri,
-        len(secret),
-        secret != secret.strip(),
-        len(code),
-        len(code_verifier),
-        settings.ml_api_base_url,
-    )
-
     client = _get_http_client()
     resp = client.post(f"{settings.ml_api_base_url}/oauth/token", data=payload)
 
@@ -133,24 +123,31 @@ def exchange_code_for_token(code: str, db: Session, state: str | None = None) ->
             resp.status_code,
             resp.text,
         )
-        # Diagnóstico TEMPORÁRIO inline — logs Python não visíveis no Render.
-        # Remover após resolver invalid_grant. Não expõe secret nem code completo.
-        verifier_fp = f"{code_verifier[:4]}...{code_verifier[-4:]}" if len(code_verifier) >= 8 else "??"
-        code_fp = f"{code[:4]}...{code[-4:]}" if len(code) >= 8 else "??"
-        diag = (
-            f" [diag: app_id={settings.ml_app_id!r} "
-            f"redirect={settings.ml_redirect_uri!r} "
-            f"secret_len={len(secret)} secret_ws={secret != secret.strip()} "
-            f"code={code_fp} code_len={len(code)} "
-            f"verifier={verifier_fp} verifier_len={len(code_verifier)}]"
-        )
-        raise MLAPIError(resp.status_code, f"Erro ao obter token: {resp.text}{diag}")
+        raise MLAPIError(resp.status_code, f"Erro ao obter token: {resp.text}")
 
     data = resp.json()
-    expires_at = _utcnow() + timedelta(seconds=data["expires_in"])
 
-    credential.access_token_encrypted = encrypt(data["access_token"])
-    credential.refresh_token_encrypted = encrypt(data["refresh_token"])
+    access_token = data.get("access_token")
+    refresh_token = data.get("refresh_token")
+    if not access_token or not refresh_token:
+        # Resposta 200 sem refresh_token = app sem scope offline_access concedido.
+        # Tratamos como erro de configuração (não deixar virar KeyError → 500).
+        logger.error(
+            "ML token response sem tokens esperados | has_access=%s has_refresh=%s scope=%r",
+            bool(access_token),
+            bool(refresh_token),
+            data.get("scope"),
+        )
+        raise MLAPIError(
+            502,
+            "Resposta do Mercado Livre sem refresh_token. Habilite o scope "
+            "'offline_access' nas configurações do app no DevCenter e tente de novo.",
+        )
+
+    expires_at = _utcnow() + timedelta(seconds=data.get("expires_in", 0))
+
+    credential.access_token_encrypted = encrypt(access_token)
+    credential.refresh_token_encrypted = encrypt(refresh_token)
     credential.token_type = data.get("token_type", "Bearer")
     credential.expires_at = expires_at
     credential.scope = data.get("scope", "")
@@ -197,9 +194,15 @@ def _refresh_token(credential: MLCredential, db: Session) -> MLCredential:
         raise MLAPIError(resp.status_code, f"Erro ao renovar token: {resp.text}")
 
     data = resp.json()
-    credential.access_token_encrypted = encrypt(data["access_token"])
-    credential.refresh_token_encrypted = encrypt(data["refresh_token"])
-    credential.expires_at = _utcnow() + timedelta(seconds=data["expires_in"])
+    access_token = data.get("access_token")
+    if not access_token:
+        raise MLAPIError(502, f"Resposta de refresh do ML sem access_token: {resp.text}")
+    credential.access_token_encrypted = encrypt(access_token)
+    # ML rotaciona o refresh_token; se não vier, mantém o atual.
+    new_refresh = data.get("refresh_token")
+    if new_refresh:
+        credential.refresh_token_encrypted = encrypt(new_refresh)
+    credential.expires_at = _utcnow() + timedelta(seconds=data.get("expires_in", 0))
     credential.scope = data.get("scope", credential.scope)
 
     db.commit()

@@ -1230,12 +1230,9 @@ async function renderAuth(el) {
             <p style="color:var(--text-tertiary);margin-bottom:var(--space-5)">
               Conecte sua conta do Mercado Livre para publicar produtos.
             </p>
-            <button class="btn btn-primary" onclick="startAuth()">1. Abrir Autenticação ML</button>
+            <button class="btn btn-primary" onclick="startAuth()">Conectar Mercado Livre</button>
           `}
         </div>
-
-        <!-- Code input area (shown after clicking auth) -->
-        <div id="auth-code-area" style="margin-top:var(--space-6)"></div>
       </div>
     `;
   } catch (err) {
@@ -1246,70 +1243,11 @@ async function renderAuth(el) {
 async function startAuth() {
   try {
     const data = await api('/auth/ml/login');
-    window.open(data.auth_url, '_blank');
-
-    const area = document.getElementById('auth-code-area');
-    area.innerHTML = `
-      <div class="card" style="max-width:520px">
-        <h2 class="section-header">2. Cole a URL de redirect</h2>
-        <p style="color:var(--text-tertiary);font-size:13px;margin-bottom:var(--space-4)">
-          Após autorizar no Mercado Livre você será redirecionado. Copie a
-          <strong>URL completa</strong> da barra do navegador (precisa conter
-          <span class="mono">code=</span> e <span class="mono">state=</span>) e cole abaixo.
-        </p>
-        <div class="flex gap-3">
-          <input type="text" id="auth-code-input" class="form-input" style="flex:1"
-            placeholder="http://localhost:8000/auth/ml/callback?code=TG-...&state=...">
-          <button class="btn btn-primary" onclick="submitAuthCode()">Conectar</button>
-        </div>
-        <p style="color:var(--text-tertiary);font-size:11px;margin-top:var(--space-3)">
-          Dica: aceita também só a query string <span class="mono">code=TG-...&state=...</span>
-        </p>
-        <div id="auth-code-result" class="mt-4"></div>
-      </div>
-    `;
-
-    document.getElementById('auth-code-input').focus();
+    // Redireciona o próprio tab para o Mercado Livre. Após autorizar, o ML chama
+    // GET /auth/ml/callback (que troca o code por token UMA vez) e redireciona de
+    // volta para /?ml=connected. O fluxo é 100% automático — sem copiar/colar.
+    window.location.href = data.auth_url;
   } catch (err) { toast(err.message, 'error'); }
-}
-
-async function submitAuthCode() {
-  const input = document.getElementById('auth-code-input');
-  let raw = input.value.trim();
-  if (!raw) { toast('Cole o código de autorização', 'error'); return; }
-
-  // Se o usuário colou a URL inteira (ou query string), extrai code + state.
-  // state é obrigatório — o backend valida HMAC e impede CSRF/replay.
-  let code = raw, state = '';
-  try {
-    if (raw.includes('?')) {
-      const u = new URL(raw);
-      code = u.searchParams.get('code') || raw;
-      state = u.searchParams.get('state') || '';
-    } else if (raw.includes('=')) {
-      const params = new URLSearchParams(raw);
-      code = params.get('code') || raw;
-      state = params.get('state') || '';
-    }
-  } catch { /* fallback: trata como code puro */ }
-
-  if (!state) {
-    toast('Cole a URL completa de redirect (precisa conter state=...)', 'error');
-    return;
-  }
-
-  const result = document.getElementById('auth-code-result');
-  result.innerHTML = '<div class="flex items-center gap-2"><div class="spinner"></div> Trocando code por token...</div>';
-
-  try {
-    await api(`/auth/ml/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`);
-    toast('Mercado Livre conectado com sucesso!', 'success');
-    updateAuthStatus();
-    navigate('auth');
-  } catch (err) {
-    result.innerHTML = `<div style="color:var(--error);font-size:13px;margin-top:var(--space-2)">${escapeHtml(err.message)}</div>`;
-    toast(err.message, 'error');
-  }
 }
 
 // --- Auth status check ---
@@ -1471,6 +1409,24 @@ function initApp() {
   });
   navigate('dashboard');
   updateAuthStatus();
+  handleMlCallbackResult();
+}
+
+// Lê o resultado do redirect do OAuth ML (/?ml=connected|error), avisa o usuário
+// e limpa o parâmetro da URL para não repetir o aviso em reloads.
+function handleMlCallbackResult() {
+  const params = new URLSearchParams(window.location.search);
+  const ml = params.get('ml');
+  if (!ml) return;
+  if (ml === 'connected') {
+    toast('Mercado Livre conectado com sucesso!', 'success');
+    updateAuthStatus();
+  } else if (ml === 'error') {
+    toast('Falha ao conectar o Mercado Livre. Tente novamente.', 'error');
+  }
+  params.delete('ml');
+  const qs = params.toString();
+  window.history.replaceState({}, '', window.location.pathname + (qs ? '?' + qs : ''));
 }
 
 // --- Init ---

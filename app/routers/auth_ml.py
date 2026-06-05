@@ -38,7 +38,7 @@ def ml_callback(
         logger.warning("Callback OAuth ML falhou: %s", exc.detail)
         # detail TEMPORÁRIO na URL para diagnóstico (logs do Render pouco acessíveis).
         # Trocar por mensagem genérica após resolver. Não expõe secret.
-        reason = quote((exc.detail or "")[:300])
+        reason = quote((exc.detail or "")[:900])
         return RedirectResponse(url=f"/?ml=error&ml_detail={reason}", status_code=303)
     except Exception as exc:  # noqa: BLE001
         # O callback OAuth nunca deve devolver 500 cru ao usuário. O traceback

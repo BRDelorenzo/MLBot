@@ -120,7 +120,8 @@ def test_exchange_db_error_raises_diagnostic(db, monkeypatch):
         exchange_code_for_token("TG-abc", db, state=state)
 
     assert "DBError" in ei.value.detail
-    assert "access_token_encrypted=" in ei.value.detail
+    assert "schema[" in ei.value.detail
+    assert "access_token_encrypted" in ei.value.detail
 
 
 _FULL_TOKEN_PAYLOAD = {

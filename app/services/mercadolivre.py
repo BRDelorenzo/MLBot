@@ -163,40 +163,33 @@ def exchange_code_for_token(code: str, db: Session, state: str | None = None) ->
         db.commit()
     except SQLAlchemyError as exc:
         db.rollback()
-        raise MLAPIError(502, _credential_db_error_diag(db, credential, enc_access, enc_refresh)) from exc
+        raise MLAPIError(502, _credential_db_error_diag(db, exc)) from exc
 
     db.refresh(credential)
     return credential
 
 
-def _credential_db_error_diag(db: Session, credential: MLCredential, enc_access: str, enc_refresh: str) -> str:
+def _credential_db_error_diag(db: Session, exc: SQLAlchemyError) -> str:
     """Diagnóstico SEGURO de erro ao gravar ml_credentials.
 
-    Compara o tamanho de cada valor com o limite real da coluna no banco para
-    apontar qual coluna estoura. Reporta APENAS nomes de coluna e inteiros —
-    nunca os valores (tokens) — então não vaza segredo.
+    Reporta o tipo do erro do driver (ex.: psycopg2 StringDataRightTruncation,
+    InvalidTextRepresentation, NotNullViolation) + o schema real (nome:tipo) de
+    cada coluna. APENAS metadados — nunca valores/tokens — então não vaza segredo.
     TEMPORÁRIO: remover após resolver o DataError em produção.
     """
-    lengths = {
-        "access_token_encrypted": len(enc_access),
-        "refresh_token_encrypted": len(enc_refresh),
-        "token_type": len(credential.token_type or ""),
-        "scope": len(credential.scope or ""),
-        "ml_user_id": len(credential.ml_user_id or ""),
-    }
-    limits: dict[str, int | None] = {}
+    orig = getattr(exc, "orig", None)
+    err_cls = type(orig).__name__ if orig is not None else type(exc).__name__
+    # pgcode (SQLSTATE) ajuda a categorizar sem expor valores.
+    pgcode = getattr(orig, "pgcode", None) or getattr(getattr(orig, "diag", None), "sqlstate", None)
+
+    schema = []
     try:
         for col in sa_inspect(db.get_bind()).get_columns("ml_credentials"):
-            limits[col["name"]] = getattr(col["type"], "length", None)
+            schema.append(f"{col['name']}:{col['type']}:{'NULL' if col.get('nullable') else 'NOTNULL'}")
     except Exception:  # noqa: BLE001 — diagnóstico best-effort
         pass
 
-    parts = []
-    for name, vlen in lengths.items():
-        lim = limits.get(name)
-        flag = " OVERFLOW" if (lim is not None and vlen > lim) else ""
-        parts.append(f"{name}={vlen}/{lim}{flag}")
-    return "DBError ao salvar credencial ML | " + " ".join(parts)
+    return f"DBError[{err_cls} pgcode={pgcode}] schema[{' '.join(schema)}]"
 
 
 # Locks por user_id para serializar refresh_token dentro do mesmo processo.

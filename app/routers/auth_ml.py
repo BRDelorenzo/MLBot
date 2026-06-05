@@ -40,6 +40,14 @@ def ml_callback(
         # Trocar por mensagem genérica após resolver. Não expõe secret.
         reason = quote((exc.detail or "")[:300])
         return RedirectResponse(url=f"/?ml=error&ml_detail={reason}", status_code=303)
+    except Exception as exc:  # noqa: BLE001
+        # O callback OAuth nunca deve devolver 500 cru ao usuário. O traceback
+        # completo vai pro log do servidor; na URL expomos APENAS o nome da classe
+        # da exceção (sem a mensagem) para não vazar PII/segredos em connection
+        # strings, paths etc. O nome já identifica a categoria da causa raiz.
+        logger.exception("Callback OAuth ML erro inesperado")
+        reason = quote(type(exc).__name__)
+        return RedirectResponse(url=f"/?ml=error&ml_detail={reason}", status_code=303)
 
     return RedirectResponse(url="/?ml=connected", status_code=303)
 

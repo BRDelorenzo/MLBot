@@ -136,3 +136,20 @@ def test_callback_redirects_with_error_on_failure(client, db, monkeypatch):
 
     assert r.status_code in (302, 303, 307)
     assert "ml=error" in r.headers["location"]
+
+
+def test_callback_never_returns_raw_500(client, db, monkeypatch):
+    """Exceção inesperada (não-MLAPIError) também vira redirect com detalhe, nunca 500."""
+    import app.routers.auth_ml as auth_ml_router
+
+    def _boom(*a, **k):
+        raise RuntimeError("kaboom-decrypt")
+
+    monkeypatch.setattr(auth_ml_router, "exchange_code_for_token", _boom)
+
+    r = client.get("/auth/ml/callback?code=TG-x&state=whatever", follow_redirects=False)
+
+    assert r.status_code in (302, 303, 307)
+    loc = r.headers["location"]
+    assert "ml=error" in loc
+    assert "kaboom-decrypt" in loc or "RuntimeError" in loc

@@ -42,5 +42,41 @@ def migrate_ai_provider_configs():
         conn.execute(text("DROP TABLE ai_provider_configs"))
 
 
+def widen_ml_credential_token_columns():
+    """Garante que as colunas de token de ml_credentials sejam TEXT.
+
+    O modelo define access_token_encrypted/refresh_token_encrypted como Text, mas
+    bancos criados em versões antigas (antes dessa definição) podem ter VARCHAR(255)
+    — pequeno demais para o token cifrado com Fernet (~250 chars). Como o create_all
+    não altera tabelas existentes, gravar o token nesse banco antigo gera DataError
+    ("value too long"). O widening é NÃO-destrutivo e idempotente, seguro em prod.
+    """
+    inspector = inspect(engine)
+    if "ml_credentials" not in inspector.get_table_names():
+        return
+
+    # SQLite não diferencia VARCHAR(n) de TEXT; só Postgres impõe o limite.
+    if engine.dialect.name != "postgresql":
+        return
+
+    cols = {c["name"]: c for c in inspector.get_columns("ml_credentials")}
+    targets = ("access_token_encrypted", "refresh_token_encrypted")
+
+    for name in targets:
+        col = cols.get(name)
+        if col is None:
+            continue
+        if "TEXT" in str(col["type"]).upper():
+            continue  # já é TEXT — nada a fazer
+        logger.warning(
+            "Widening ml_credentials.%s para TEXT (era %s)", name, col["type"]
+        )
+        with engine.begin() as conn:
+            conn.execute(
+                text(f"ALTER TABLE ml_credentials ALTER COLUMN {name} TYPE TEXT")
+            )
+
+
 def run_all():
     migrate_ai_provider_configs()
+    widen_ml_credential_token_columns()

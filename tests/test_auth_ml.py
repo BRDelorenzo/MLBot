@@ -100,6 +100,29 @@ def test_exchange_happy_path_stores_tokens(db, monkeypatch):
     assert cred.pkce_verifier is None
 
 
+def test_exchange_db_error_raises_diagnostic(db, monkeypatch):
+    """Erro de banco no commit vira MLAPIError com diagnóstico de tamanhos."""
+    from sqlalchemy.exc import SQLAlchemyError
+
+    state = _seed_credential(db, user_id=1)
+    resp = _FakeResp(
+        200,
+        {"access_token": "AT", "refresh_token": "RT", "expires_in": 3600, "token_type": "Bearer", "user_id": 99},
+    )
+    monkeypatch.setattr(mercadolivre, "_get_http_client", lambda *a, **k: _FakeClient(resp))
+
+    def _boom():
+        raise SQLAlchemyError("value too long")
+
+    monkeypatch.setattr(db, "commit", _boom)
+
+    with pytest.raises(MLAPIError) as ei:
+        exchange_code_for_token("TG-abc", db, state=state)
+
+    assert "DBError" in ei.value.detail
+    assert "access_token_encrypted=" in ei.value.detail
+
+
 _FULL_TOKEN_PAYLOAD = {
     "access_token": "AT",
     "refresh_token": "RT",

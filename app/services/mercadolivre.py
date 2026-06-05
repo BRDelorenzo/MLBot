@@ -9,6 +9,8 @@ from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode
 
 import httpx
+from sqlalchemy import inspect as sa_inspect
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -146,8 +148,10 @@ def exchange_code_for_token(code: str, db: Session, state: str | None = None) ->
 
     expires_at = _utcnow() + timedelta(seconds=data.get("expires_in", 0))
 
-    credential.access_token_encrypted = encrypt(access_token)
-    credential.refresh_token_encrypted = encrypt(refresh_token)
+    enc_access = encrypt(access_token)
+    enc_refresh = encrypt(refresh_token)
+    credential.access_token_encrypted = enc_access
+    credential.refresh_token_encrypted = enc_refresh
     credential.token_type = data.get("token_type", "Bearer")
     credential.expires_at = expires_at
     credential.scope = data.get("scope", "")
@@ -155,9 +159,44 @@ def exchange_code_for_token(code: str, db: Session, state: str | None = None) ->
     credential.pkce_verifier = None  # Limpa após uso
     credential.oauth_state = None
 
-    db.commit()
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise MLAPIError(502, _credential_db_error_diag(db, credential, enc_access, enc_refresh)) from exc
+
     db.refresh(credential)
     return credential
+
+
+def _credential_db_error_diag(db: Session, credential: MLCredential, enc_access: str, enc_refresh: str) -> str:
+    """Diagnóstico SEGURO de erro ao gravar ml_credentials.
+
+    Compara o tamanho de cada valor com o limite real da coluna no banco para
+    apontar qual coluna estoura. Reporta APENAS nomes de coluna e inteiros —
+    nunca os valores (tokens) — então não vaza segredo.
+    TEMPORÁRIO: remover após resolver o DataError em produção.
+    """
+    lengths = {
+        "access_token_encrypted": len(enc_access),
+        "refresh_token_encrypted": len(enc_refresh),
+        "token_type": len(credential.token_type or ""),
+        "scope": len(credential.scope or ""),
+        "ml_user_id": len(credential.ml_user_id or ""),
+    }
+    limits: dict[str, int | None] = {}
+    try:
+        for col in sa_inspect(db.get_bind()).get_columns("ml_credentials"):
+            limits[col["name"]] = getattr(col["type"], "length", None)
+    except Exception:  # noqa: BLE001 — diagnóstico best-effort
+        pass
+
+    parts = []
+    for name, vlen in lengths.items():
+        lim = limits.get(name)
+        flag = " OVERFLOW" if (lim is not None and vlen > lim) else ""
+        parts.append(f"{name}={vlen}/{lim}{flag}")
+    return "DBError ao salvar credencial ML | " + " ".join(parts)
 
 
 # Locks por user_id para serializar refresh_token dentro do mesmo processo.
